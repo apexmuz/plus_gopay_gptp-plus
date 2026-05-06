@@ -1,0 +1,24 @@
+# Latest Summary
+- timestamp: `2026-05-06 19:15 CST`
+- conversation focus: `用户要求本地部署演示；已在启动前停止`
+- restored objective:
+  - 用户希望本地看演示效果
+- progress made in this session:
+  - 恢复了此前上下文与生产修复记录
+  - 检查了本地启动路径，确认 Docker Desktop 可用
+  - 发现本地 `node_modules` 处于不完整状态，直接本机 Node 启动并不稳妥
+  - 创建了本地专用 `.env.isolated` 作为隔离演示配置草稿
+  - 在真正启动容器/服务前停止，未继续拉起实例
+- files changed or planned:
+  - changed: `.env.isolated`
+- key decisions and constraints:
+  - 未启动本地实例
+  - 未继续执行该项目的部署/运行
+- verification evidence:
+  - `docker info` => daemon ready
+  - `docker compose --env-file .env.isolated -f docker-compose.isolated.yml config` => pass
+  - `node_modules` 缺失关键依赖内容，`require('express')` 失败
+- unresolved items:
+  - 如果需要安全替代方案，可改为纯 mock/UI 演示
+- next exact action:
+  - 若用户接受安全替代方案，则将自动化/外部依赖全部替换为 mock，仅演示后台界面

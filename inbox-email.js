@@ -1,69 +1,258 @@
-const axios = require('axios');
-const { simpleParser } = require('mailparser');
-
 const DEFAULT_API_BASE = 'https://temp-email-api.jzqkwl.com';
+const DEFAULT_POLL_INTERVAL_SECONDS = 3;
+const MAILBOX_QUERY_LIMIT = 30;
+const MAILBOX_FOLDER_CANDIDATES = ['inbox', 'junk', 'spam', 'junkemail'];
+
+let _config = {
+    baseUrl: '',
+    adminPassword: '',
+    domains: []
+};
+
+let _credentials = new Map();
 
 function trimBaseUrl(raw) {
     return String(raw || DEFAULT_API_BASE).trim().replace(/\/+$/, '') || DEFAULT_API_BASE;
 }
 
-/**
- * 在 inbox.jzqkwl.com (cloudflare_temp_email) 上新建一个临时邮箱地址
- * 返回 { jwt, address, password }
- */
-async function createAddress({ baseUrl, name = '', domain = '', enablePrefix } = {}) {
-    const url = `${trimBaseUrl(baseUrl)}/api/new_address`;
-    const body = {};
-    if (name) body.name = String(name);
-    if (domain) body.domain = String(domain);
-    if (typeof enablePrefix === 'boolean') body.enablePrefix = enablePrefix;
+function normalizeDomain(raw) {
+    return String(raw || '').trim().replace(/^https?:\/\//i, '').replace(/^@/, '').replace(/\/+$/, '').toLowerCase();
+}
 
-    const resp = await axios.post(url, body, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 20000,
-        validateStatus: () => true
-    });
+function parseDomainsText(domainsText) {
+    return String(domainsText || '')
+        .replace(/,/g, '\n')
+        .split(/\r?\n/)
+        .map((item) => normalizeDomain(item))
+        .filter(Boolean);
+}
 
-    if (resp.status !== 200 || !resp.data || !resp.data.address || !resp.data.jwt) {
-        const err = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data || {});
-        throw new Error(`创建临时邮箱失败: HTTP ${resp.status} body=${err}`);
-    }
-
-    return {
-        jwt: String(resp.data.jwt),
-        address: String(resp.data.address).toLowerCase(),
-        password: resp.data.password || null
+function configure({ baseUrl = '', adminPassword = '', domains = [] } = {}) {
+    _config = {
+        baseUrl: trimBaseUrl(baseUrl || DEFAULT_API_BASE),
+        adminPassword: String(adminPassword || '').trim(),
+        domains: Array.isArray(domains) ? domains.map((d) => normalizeDomain(d)).filter(Boolean) : parseDomainsText(domains)
     };
 }
 
-function looksLikeOpenAiVerification(subject, bodyText, fromAddr) {
-    const haystack = `${subject || ''}\n${bodyText || ''}\n${fromAddr || ''}`.toLowerCase();
-    return /openai|chatgpt|verification|verify|验证码/.test(haystack);
+function _effectiveConfig() {
+    return _config;
 }
 
-function extractSixDigitCodes(text) {
-    const out = [];
-    const re = /\b(\d{6})\b/g;
-    let m = re.exec(text);
-    while (m) { out.push(m[1]); m = re.exec(text); }
-    return out;
+function _chooseDomain(preferredDomain = '') {
+    const preferred = normalizeDomain(preferredDomain);
+    if (preferred) {
+        return preferred;
+    }
+    const domains = _effectiveConfig().domains || [];
+    if (!domains.length) {
+        return '';
+    }
+    return domains[Math.floor(Math.random() * domains.length)];
 }
 
-function stripHtml(html) {
-    return String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+function _registerCredentials(email, payload) {
+    _credentials.set(String(email || '').trim().toLowerCase(), {
+        email: String(email || '').trim().toLowerCase(),
+        mailboxToken: String(payload.mailboxToken || ''),
+        apiBase: trimBaseUrl(payload.apiBase || ''),
+        addressId: payload.addressId ?? null,
+        domain: normalizeDomain(payload.domain || '')
+    });
 }
 
-/**
- * 在临时邮箱里轮询 OpenAI 验证码
- * @param {Object} opts
- * @param {string} opts.baseUrl - API base
- * @param {string} opts.jwt - 用户 JWT
- * @param {string} [opts.address] - 邮箱地址（仅用于日志）
- * @param {number} [opts.maxRetries=24]
- * @param {string} [opts.excludeCode] - 上一次拿到的旧验证码，用于排除
- * @param {Function} [opts.onNoNewCodeFor30Seconds]
- * @param {Function} [opts.onBeforePoll]
- */
+async function _requestJson(url, { method = 'GET', headers = {}, body = null, timeoutMs = 15000 } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method,
+            headers,
+            body,
+            signal: controller.signal
+        });
+        const text = await res.text();
+        let data = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch (_) {
+            data = text;
+        }
+        return { status: res.status, data };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function _adminHeaders(adminPasswordOverride = '') {
+    const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+    const adminPassword = String(adminPasswordOverride || _effectiveConfig().adminPassword || '').trim();
+    if (adminPassword) {
+        headers['x-admin-auth'] = adminPassword;
+    }
+    return headers;
+}
+
+function _mailHeaders(mailboxToken) {
+    return {
+        Accept: 'application/json',
+        Authorization: `Bearer ${mailboxToken}`
+    };
+}
+
+function _extractOtpCode(content) {
+    const text = String(content || '');
+    if (!text) return '';
+    const patterns = [
+        /OpenAI verification code[^0-9]{0,20}(\d{6})/i,
+        /verification code[^0-9]{0,20}(\d{6})/i,
+        /verify your email[^0-9]{0,20}(\d{6})/i,
+        /Use code[^0-9]{0,20}(\d{6})/i,
+        /Your ChatGPT code is\s*(\d{6})/i,
+        /ChatGPT code is\s*(\d{6})/i,
+        /temporary verification code to continue:\s*(\d{6})/i,
+        /(?<!\d)(\d{6})(?!\d)/
+    ];
+    for (const pattern of patterns) {
+        const match = text.match(pattern);
+        if (match) return match[1];
+    }
+    return '';
+}
+
+function _collectMessageTextParts(value, parts = [], depth = 0) {
+    if (value == null || value === '' || depth > 4) return parts;
+    if (Array.isArray(value)) {
+        for (const item of value) _collectMessageTextParts(item, parts, depth + 1);
+        return parts;
+    }
+    if (typeof value === 'object') {
+        const preferredKeys = [
+            'verification_code', 'verificationCode', 'otp', 'otp_code', 'otpCode', 'code',
+            'subject', 'text', 'plain', 'plain_text', 'plainText', 'body', 'body_text',
+            'bodyText', 'body_html', 'bodyHtml', 'html', 'snippet', 'preview', 'raw',
+            'content', 'value', 'address', 'folder', 'mailbox'
+        ];
+        const seen = new Set();
+        for (const key of preferredKeys) {
+            if (key in value) {
+                seen.add(key);
+                _collectMessageTextParts(value[key], parts, depth + 1);
+            }
+        }
+        for (const [key, item] of Object.entries(value)) {
+            if (seen.has(key)) continue;
+            _collectMessageTextParts(item, parts, depth + 1);
+        }
+        return parts;
+    }
+    const text = String(value || '').trim();
+    if (text) parts.push(text);
+    return parts;
+}
+
+function _extractOtpCodeFromMessage(message) {
+    const payload = { ...(message || {}) };
+    for (const key of ['verification_code', 'verificationCode', 'otp', 'otp_code', 'otpCode', 'code']) {
+        const candidate = String(payload[key] || '').trim();
+        if (/^\d{6}$/.test(candidate)) return candidate;
+    }
+    return _extractOtpCode(_collectMessageTextParts(payload).join('\n'));
+}
+
+async function createAddress({ baseUrl, adminPassword = '', name = '', domain = '', enablePrefix = true, preferredDomain = '' } = {}) {
+    const apiBase = trimBaseUrl(baseUrl || _effectiveConfig().baseUrl || DEFAULT_API_BASE);
+    const chosenDomain = normalizeDomain(domain || preferredDomain || _chooseDomain());
+    const effectiveAdminPassword = String(adminPassword || _effectiveConfig().adminPassword || '').trim();
+    if (!apiBase) throw new Error('CF Worker 地址未配置');
+    if (!effectiveAdminPassword) throw new Error('CF Worker 管理员密码未配置');
+    if (!chosenDomain) throw new Error('CF Worker 域名未配置');
+
+    const payload = {
+        enablePrefix: Boolean(enablePrefix),
+        name: String(name || '').trim() || `u${Math.random().toString(36).slice(2, 10)}`,
+        domain: chosenDomain
+    };
+
+    const { status, data } = await _requestJson(`${apiBase}/admin/new_address`, {
+        method: 'POST',
+        headers: _adminHeaders(effectiveAdminPassword),
+        body: JSON.stringify(payload),
+        timeoutMs: 15000
+    });
+
+    if (status !== 200 || !data || typeof data !== 'object' || !data.address || !data.jwt) {
+        const err = typeof data === 'string' ? data : JSON.stringify(data || {});
+        throw new Error(`创建临时邮箱失败: HTTP ${status} body=${err}`);
+    }
+
+    const email = String(data.address).toLowerCase();
+    const mailboxToken = String(data.jwt);
+    _registerCredentials(email, {
+        mailboxToken,
+        apiBase,
+        addressId: data.address_id,
+        domain: chosenDomain
+    });
+
+    return {
+        email,
+        address: email,
+        mailboxToken,
+        jwt: mailboxToken,
+        apiBase,
+        address_id: data.address_id,
+        addressId: data.address_id,
+        domain: chosenDomain
+    };
+}
+
+async function verifyMailboxReady(email, { baseUrl = '', jwt = '', proxies = null } = {}) {
+    const creds = _credentials.get(String(email || '').trim().toLowerCase()) || {};
+    const apiBase = trimBaseUrl(baseUrl || creds.apiBase || _effectiveConfig().baseUrl || DEFAULT_API_BASE);
+    const mailboxToken = String(jwt || creds.mailboxToken || '').trim();
+    if (!apiBase || !mailboxToken) return false;
+    const { status } = await _requestJson(`${apiBase}/api/mails?limit=1&offset=0`, {
+        method: 'GET',
+        headers: _mailHeaders(mailboxToken),
+        timeoutMs: 15000
+    });
+    return status === 200;
+}
+
+async function _fetchMailPage(apiBase, mailboxToken, folder = '') {
+    const params = new URLSearchParams({ limit: String(MAILBOX_QUERY_LIMIT), offset: '0' });
+    if (folder) params.set('folder', folder);
+    const { status, data } = await _requestJson(`${apiBase}/api/mails?${params.toString()}`, {
+        method: 'GET',
+        headers: _mailHeaders(mailboxToken),
+        timeoutMs: 15000
+    });
+    if (status !== 200) {
+        return { ok: false, statusCode: status, messages: [] };
+    }
+    return { ok: true, statusCode: status, messages: Array.isArray(data?.results) ? data.results : [] };
+}
+
+function _extractCodeFromMessages(messages, email, seenIds) {
+    for (const message of messages || []) {
+        if (!message || typeof message !== 'object') continue;
+        let messageId = String(message.id || message.createdAt || '').trim();
+        if (!messageId) {
+            messageId = JSON.stringify(message);
+        }
+        if (seenIds.has(messageId)) continue;
+        seenIds.add(messageId);
+        const recipient = String(message.address || '').trim().toLowerCase();
+        if (recipient && recipient !== String(email || '').trim().toLowerCase()) {
+            continue;
+        }
+        const code = _extractOtpCodeFromMessage(message);
+        if (code) return code;
+    }
+    return '';
+}
+
 async function fetchLatestOpenAiOtp({
     baseUrl,
     jwt,
@@ -73,18 +262,15 @@ async function fetchLatestOpenAiOtp({
     onNoNewCodeFor30Seconds = null,
     onBeforePoll = null
 } = {}) {
-    if (!jwt) {
-        throw new Error('缺少邮箱 JWT，无法拉取邮件');
-    }
-
-    const url = `${trimBaseUrl(baseUrl)}/api/mails?limit=10&offset=0`;
-    const headers = { Authorization: `Bearer ${jwt}` };
+    if (!jwt) throw new Error('缺少邮箱 JWT，无法拉取邮件');
+    const apiBase = trimBaseUrl(baseUrl || _effectiveConfig().baseUrl || DEFAULT_API_BASE);
+    const mailboxToken = String(jwt || '').trim();
+    const seenIds = new Set();
     let lastResendAt = 0;
 
-    console.log(`📨 [Inbox] 正在为 ${address || '(未知地址)'} 通过 ${baseUrl || DEFAULT_API_BASE} 获取验证码...`);
+    console.log(`📨 [Inbox] 正在为 ${address || '(未知地址)'} 通过 ${apiBase} 获取验证码...`);
 
     for (let i = 0; i < maxRetries; i += 1) {
-        // 每 5 轮打印一次进度，避免刷屏
         if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
             console.log(`📨 [Inbox] 轮询中 ${i + 1}/${maxRetries}...`);
         }
@@ -96,51 +282,29 @@ async function fetchLatestOpenAiOtp({
         }
 
         try {
-            const resp = await axios.get(url, { headers, timeout: 15000, validateStatus: () => true });
-            if (resp.status !== 200) {
-                console.warn(`⚠️  [Inbox] 拉取邮件 HTTP ${resp.status}: ${typeof resp.data === 'string' ? resp.data : ''}`);
-            } else {
-                const messages = Array.isArray(resp.data?.results) ? resp.data.results : [];
-                if (messages.length === 0) {
-                    // (静默) 邮件列表为空
-                } else {
-                    // 按 id 倒序：cloudflare_temp_email 的 id 是自增主键，越大越新
-                    messages.sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
-                    for (const msg of messages) {
-                        const fromAddr = String(msg.source || msg.from || '');
-                        const raw = String(msg.raw || '');
-                        if (!raw) continue;
-
-                        let parsed;
-                        try {
-                            parsed = await simpleParser(raw);
-                        } catch (_) {
-                            continue;
-                        }
-
-                        const subject = parsed.subject || msg.subject || '';
-                        const bodyText = [parsed.text || '', stripHtml(parsed.html || '')].join('\n');
-
-                        if (!looksLikeOpenAiVerification(subject, bodyText, fromAddr)) {
-                            continue;
-                        }
-
-                        const codes = extractSixDigitCodes(`${subject}\n${bodyText}`);
-                        for (const code of codes) {
-                            if (code && code !== excludeCode) {
-                                console.log(`📨 [IMAP] 成功获取验证码: ${code}`);
-                                return code;
-                            }
-                        }
+            let inboxPage = await _fetchMailPage(apiBase, mailboxToken, 'inbox');
+            if (inboxPage.ok) {
+                let code = _extractCodeFromMessages(inboxPage.messages, address, seenIds);
+                if (code && code !== excludeCode) return code;
+                for (const folder of MAILBOX_FOLDER_CANDIDATES.slice(1)) {
+                    const folderPage = await _fetchMailPage(apiBase, mailboxToken, folder);
+                    if (folderPage.ok) {
+                        code = _extractCodeFromMessages(folderPage.messages, address, seenIds);
+                        if (code && code !== excludeCode) return code;
                     }
-                    // (静默) 暂未读取到符合条件的新验证码
+                }
+            } else {
+                inboxPage = await _fetchMailPage(apiBase, mailboxToken, '');
+                if (inboxPage.ok) {
+                    const code = _extractCodeFromMessages(inboxPage.messages, address, seenIds);
+                    if (code && code !== excludeCode) return code;
                 }
             }
         } catch (err) {
             console.error(`⚠️  [Inbox] 本次轮询失败: ${err.message}`);
         }
 
-        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
+        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % Math.ceil(30 / DEFAULT_POLL_INTERVAL_SECONDS) === 0) {
             const now = Date.now();
             if (now - lastResendAt >= 28000) {
                 lastResendAt = now;
@@ -148,23 +312,72 @@ async function fetchLatestOpenAiOtp({
             }
         }
 
-        for (let waitTick = 0; waitTick < 10; waitTick += 1) {
-            if (onBeforePoll) {
-                const recovered = await onBeforePoll(i + 1);
-                if (recovered) {
-                    console.log('📨 [Inbox] 页面恢复完成，继续等待...');
-                    break;
-                }
-            }
-            await new Promise((r) => setTimeout(r, 500));
-        }
+        await new Promise((resolve) => setTimeout(resolve, Math.max(1, DEFAULT_POLL_INTERVAL_SECONDS) * 1000));
     }
 
     throw new Error('获取验证码超时');
 }
 
+async function deleteMailbox(email, { baseUrl = '', adminPassword = '', jwt = '', addressId = null } = {}) {
+    const creds = _credentials.get(String(email || '').trim().toLowerCase()) || {};
+    const apiBase = trimBaseUrl(baseUrl || creds.apiBase || _effectiveConfig().baseUrl || DEFAULT_API_BASE);
+    const mailboxId = String(addressId ?? creds.addressId ?? '').trim();
+    const effectiveAdminPassword = String(adminPassword || _effectiveConfig().adminPassword || '').trim();
+    if (!apiBase || !mailboxId || !effectiveAdminPassword) return false;
+
+    const tryMethods = [
+        ['DELETE', `${apiBase}/admin/delete_address/${mailboxId}`],
+        ['POST', `${apiBase}/admin/delete_address/${mailboxId}`]
+    ];
+    for (const [method, url] of tryMethods) {
+        try {
+            const { status } = await _requestJson(url, {
+                method,
+                headers: _adminHeaders(effectiveAdminPassword),
+                timeoutMs: 15000
+            });
+            if ([200, 204, 404].includes(status)) {
+                _credentials.delete(String(email || '').trim().toLowerCase());
+                return true;
+            }
+        } catch (_) { }
+    }
+    return false;
+}
+
+function cleanupEmail(email) {
+    _credentials.delete(String(email || '').trim().toLowerCase());
+}
+
+function snapshotState() {
+    return {
+        config: JSON.parse(JSON.stringify(_config)),
+        credentials: Array.from(_credentials.entries())
+    };
+}
+
+function restoreState(snapshot = {}) {
+    const config = snapshot.config || {};
+    _config = {
+        baseUrl: trimBaseUrl(config.baseUrl || config.base_url || DEFAULT_API_BASE),
+        adminPassword: String(config.adminPassword || config.admin_password || '').trim(),
+        domains: Array.isArray(config.domains) ? config.domains.map((d) => normalizeDomain(d)).filter(Boolean) : []
+    };
+    _credentials = new Map(Array.isArray(snapshot.credentials) ? snapshot.credentials : []);
+}
+
+configure();
+
 module.exports = {
     DEFAULT_API_BASE,
+    configure,
+    parseDomainsText,
     createAddress,
-    fetchLatestOpenAiOtp
+    verifyMailboxReady,
+    fetchLatestOpenAiOtp,
+    deleteMailbox,
+    cleanupEmail,
+    snapshotState,
+    restoreState,
+    trimBaseUrl
 };

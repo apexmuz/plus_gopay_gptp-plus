@@ -1,0 +1,64 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plus_gopay_gptp_plus_app
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env.isolated
+    environment:
+      PORT: 3000
+      DB_HOST: plus_gopay_gptp_plus_db
+      DB_PORT: 3306
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "13000:3000"
+    shm_size: "1gb"
+    volumes:
+      - ./product_files:/app/product_files
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - plus_gopay_gptp_plus_net
+
+  db:
+    image: mysql:8.0
+    container_name: plus_gopay_gptp_plus_db
+    restart: unless-stopped
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max_connections=200
+    env_file:
+      - .env.isolated
+    environment:
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - plus_gopay_gptp_plus_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - plus_gopay_gptp_plus_net
+
+networks:
+  plus_gopay_gptp_plus_net:
+    driver: bridge
+
+volumes:
+  plus_gopay_gptp_plus_mysql_data:

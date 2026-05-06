@@ -717,6 +717,8 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
     if (emailSource === 'inbox') {
         childEnv.INBOX_API_BASE = String(await store.getAppConfigValue('inbox_api_base', 'https://temp-email-api.jzqkwl.com'))
             .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
+        childEnv.INBOX_ADMIN_PASSWORD = String(await store.getAppConfigValue('inbox_admin_password', ''))
+            .trim();
         childEnv.INBOX_EMAIL_DOMAIN = String(await store.getAppConfigValue('inbox_email_domain', ''))
             .trim().replace(/^@/, '');
         // 多域名：一行一个 / 逗号 / 分号 / 空格分隔，子进程会随机挑一个

@@ -131,6 +131,7 @@ async function initializeBaseData() {
             'random_email_domain', 'chiyiyi.cloud',
             'email_source', 'random',
             'inbox_api_base', 'https://temp-email-api.jzqkwl.com',
+            'inbox_admin_password', '',
             'inbox_email_domain', '',
             'inbox_email_domains', ''
         ]
@@ -325,7 +326,7 @@ async function getAdminData() {
         runQuery(
             `SELECT config_key, config_value
              FROM app_config
-             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 'proxy',
                 'max_concurrent_activations',
@@ -338,6 +339,7 @@ async function getAdminData() {
                 'random_email_domain',
                 'email_source',
                 'inbox_api_base',
+                'inbox_admin_password',
                 'inbox_email_domain',
                 'inbox_email_domains'
             ]
@@ -407,6 +409,7 @@ async function getAdminData() {
             pool_email_include_junk: String(configMap.pool_email_include_junk || '1') === '1',
             random_email_domain: String(configMap.random_email_domain || 'chiyiyi.cloud').trim().replace(/^@/, '') || 'chiyiyi.cloud',
             inbox_api_base: String(configMap.inbox_api_base || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
+            inbox_admin_password: String(configMap.inbox_admin_password || '').trim(),
             inbox_email_domain: String(configMap.inbox_email_domain || '').trim().replace(/^@/, ''),
             inbox_email_domains: String(configMap.inbox_email_domains || '').split(/[\n,;\s]+/).map((d) => d.trim().replace(/^@/, '')).filter(Boolean),
             phone_pool: phoneRows.map((row) => ({
@@ -486,6 +489,7 @@ async function saveConfig(config) {
         || 'chiyiyi.cloud';
     const inboxApiBase = String(config?.inbox_api_base || 'https://temp-email-api.jzqkwl.com')
         .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
+    const inboxAdminPassword = String(config?.inbox_admin_password || '').trim();
     const inboxEmailDomain = String(config?.inbox_email_domain || '').trim().replace(/^@/, '').toLowerCase();
     // 多域名（一行一个 / 逗号 / 空格分隔）
     const inboxEmailDomainsList = (() => {
@@ -505,7 +509,7 @@ async function saveConfig(config) {
     await withTransaction(async (connection) => {
         await runExecute(
             `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
+             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
              ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
             [
                 'proxy', proxy,
@@ -519,6 +523,7 @@ async function saveConfig(config) {
                 'random_email_domain', randomEmailDomain,
                 'email_source', emailSource,
                 'inbox_api_base', inboxApiBase,
+                'inbox_admin_password', inboxAdminPassword,
                 'inbox_email_domain', inboxEmailDomain,
                 'inbox_email_domains', inboxEmailDomainsRaw
             ],

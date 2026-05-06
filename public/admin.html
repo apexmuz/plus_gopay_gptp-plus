@@ -1865,10 +1865,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                             <div class="email-source-body">
                                 <div class="email-source-title">
                                     <i data-lucide="inbox"></i>
-                                    <span>Inbox 临时邮箱（cloudflare_temp_email）</span>
+                                    <span>CF Worker 临时邮箱</span>
                                 </div>
                                 <div class="email-source-desc">
-                                    每次注册自动调用 <code>POST /api/new_address</code> 创建一个临时邮箱，OTP 通过 <code>GET /api/mails</code> 拉取。无需邮箱池，开箱即用。
+                                    每次注册自动调用 CF Worker 管理接口创建邮箱，OTP 通过邮箱 API 拉取。无需邮箱池，适合公网自建邮箱接码。
                                 </div>
                             </div>
                         </label>
@@ -1889,17 +1889,24 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
 
                     <div id="inbox_email_options" style="margin-top: 18px;" data-disabled="1">
                         <div class="form-group">
-                            <label>Inbox API 地址</label>
-                            <input type="text" id="inbox_api_base" class="asset-input" placeholder="https://temp-email-api.jzqkwl.com">
+                            <label>CF Worker API 地址</label>
+                            <input type="text" id="inbox_api_base" class="asset-input" placeholder="https://your-worker.example.com">
                             <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
-                                cloudflare_temp_email 的 API 后端，结尾不要带 <code>/</code>。
+                                例如：<code>https://mail.your-domain.com</code>，结尾不要带 <code>/</code>。
+                            </p>
+                        </div>
+                        <div class="form-group" style="margin-top: 14px;">
+                            <label>CF Worker 管理员密码</label>
+                            <input type="password" id="inbox_admin_password" class="asset-input" placeholder="用于 x-admin-auth">
+                            <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
+                                创建/删除邮箱时通过请求头 <code>x-admin-auth</code> 发送。仅 inbox 模式使用。
                             </p>
                         </div>
                         <div class="form-group" style="margin-top: 14px;">
                             <label>临时邮箱域名（单个，可选）</label>
                             <div style="display: flex; align-items: center; gap: 6px;">
                                 <span style="color: var(--text-dim); font-size: 14px;">@</span>
-                                <input type="text" id="inbox_email_domain" class="asset-input" placeholder="留空走默认域名（如 xm.jzqkwl.com）" style="flex: 1;">
+                                <input type="text" id="inbox_email_domain" class="asset-input" placeholder="留空走默认域名（如 mail.example.com）" style="flex: 1;">
                             </div>
                             <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
                                 单一域名兜底；若下方"多域名候选"非空则优先随机使用多域名候选。
@@ -1908,7 +1915,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                         <div class="form-group" style="margin-top: 14px;">
                             <label>多域名候选（一行一个，随机轮换）</label>
                             <textarea id="inbox_email_domains" class="asset-input" rows="4"
-                                      placeholder="一行一个，例如：&#10;mail.jzqkwl.com&#10;xm.jzqkwl.com"
+                                      placeholder="一行一个，例如：&#10;mail.example.com&#10;mx.example.com"
                                       style="width: 100%; font-family: monospace; resize: vertical;"></textarea>
                             <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
                                 每次注册时<strong>随机挑一个</strong>使用，避免单一域名被风控/限频导致收不到验证码。新加域名直接换行追加即可。
@@ -3456,6 +3463,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 if (inboxBaseEl) {
                     inboxBaseEl.value = data.config.inbox_api_base || 'https://temp-email-api.jzqkwl.com';
                 }
+                const inboxAdminPasswordEl = document.getElementById('inbox_admin_password');
+                if (inboxAdminPasswordEl) {
+                    inboxAdminPasswordEl.value = data.config.inbox_admin_password || '';
+                }
                 const inboxDomainEl = document.getElementById('inbox_email_domain');
                 if (inboxDomainEl) {
                     inboxDomainEl.value = data.config.inbox_email_domain || '';
@@ -3629,6 +3640,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 pool_email_include_junk: Boolean(document.getElementById('pool_email_include_junk')?.checked),
                 random_email_domain: normalizeRandomDomain(document.getElementById('random_email_domain')?.value),
                 inbox_api_base: String(document.getElementById('inbox_api_base')?.value || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
+                inbox_admin_password: String(document.getElementById('inbox_admin_password')?.value || '').trim(),
                 inbox_email_domain: String(document.getElementById('inbox_email_domain')?.value || '').trim().replace(/^@/, ''),
                 inbox_email_domains: String(document.getElementById('inbox_email_domains')?.value || '')
                     .split(/[\n,;\s]+/)

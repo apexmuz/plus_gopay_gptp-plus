@@ -97,7 +97,7 @@
 - **PayPal 字段 fast 填充**：模拟密码管理器粘贴节奏，反制「键盘事件过长」打分
 
 ### 3) 多渠道邮箱
-- **Cloudflare temp_email** 协议（多域名随机选 + 失败黑名单）
+- **CF Worker 临时邮箱**（多域名随机选 + 失败黑名单 + `x-admin-auth` 管理接口）
 - **Microsoft Outlook IMAP / XOAUTH2** 邮箱池
 - **OpenAI 自有随机域名** 三选一，可在后台动态切换
 
@@ -161,6 +161,15 @@ PROXY=http://user:pass@your-proxy:port    # 强烈建议住宅代理
 SMS_API_KEY=<sms-platform-key>
 ```
 
+如果你使用 **CF Worker 临时邮箱**，还需要配置：
+```
+INBOX_API_BASE=https://mail.your-domain.com
+INBOX_ADMIN_PASSWORD=<x-admin-auth-password>
+INBOX_EMAIL_DOMAIN=mail.your-domain.com
+# 或者使用多域名：
+INBOX_EMAIL_DOMAINS=mail1.your-domain.com,mail2.your-domain.com
+```
+
 > 银行卡 / 手机号 / 邮箱建议**通过后台「资产池」入库管理**，而不是写在 `.env` 里。
 
 ### 4. 启动
@@ -186,7 +195,7 @@ MySQL => root@127.0.0.1:3306/plus_papay
 
 ### 5. 第一次跑一单
 
-1. 后台 → **系统配置**：填好 PayPal 邮箱域名、临时邮箱 API、代理
+1. 后台 → **系统配置**：填好 PayPal 邮箱域名、CF Worker 邮箱 API / 管理员密码 / 域名、代理
 2. 后台 → **资产池**：导入手机号 / 银行卡 / Outlook 邮箱池
 3. 后台 → **任务管理** → **后台批量** → `count=1, workerCount=1` → 触发
 4. 在「运行日志」页面观察整个流程；成功后会在「成品列表」看到 `🟢 SUCCESS` 一行
@@ -203,7 +212,7 @@ MySQL => root@127.0.0.1:3306/plus_papay
 ├── index.js                 # Stripe + PayPal 支付流程（Playwright 子进程）
 ├── oauth_login.js           # 支付后二次登录抓 refresh_token
 ├── chatgpt.js               # OpenAI checkout / order API 客户端
-├── inbox-email.js           # cloudflare_temp_email 适配
+├── inbox-email.js           # CF Worker 临时邮箱适配
 ├── pool-email-imap.js       # Outlook IMAP / XOAUTH2 邮箱池
 ├── imap-auth.js             # 自有 IMAP 服务的鉴权 token 缓存
 ├── mysql-store.js           # 全部 MySQL CRUD：资产、配置、成品

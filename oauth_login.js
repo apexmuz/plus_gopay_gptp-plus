@@ -6,6 +6,11 @@ const fs = require('fs');
 const path = require('path');
 const { getImapAuthHeaders } = require('./imap-auth');
 const inboxEmail = require('./inbox-email');
+const {
+    needsPlaywrightProxyBridge,
+    startLocalPlaywrightProxyBridge,
+    stopLocalPlaywrightProxyBridge
+} = require('./playwright-proxy-bridge');
 
 // 使用 stealth 插件
 chromium.use(stealth);
@@ -857,14 +862,22 @@ async function runFullProtocolFlow(email) {
 
     let browser;
     let page = null;
+    let proxyBridge = null;
     try {
         const launchOptions = {
             headless: true
         };
-        const playwrightProxy = buildPlaywrightProxy(proxyValue);
+        let playwrightProxyValue = proxyValue;
+        if (needsPlaywrightProxyBridge(proxyValue)) {
+            proxyBridge = await startLocalPlaywrightProxyBridge(proxyValue);
+            playwrightProxyValue = proxyBridge.localProxyUrl;
+            console.log('🌉 [系统] 已为带认证 SOCKS5 代理创建本地匿名桥接');
+        }
+
+        const playwrightProxy = buildPlaywrightProxy(playwrightProxyValue);
         if (playwrightProxy) {
             launchOptions.proxy = playwrightProxy;
-            const _proxyHost = (() => { try { return new URL(proxyValue).host; } catch (_) { return '已配置'; } })();
+            const _proxyHost = (() => { try { return new URL(playwrightProxyValue).host; } catch (_) { return '已配置'; } })();
             console.log(`🌐 [系统] 代理已配置`);
         }
 
@@ -925,6 +938,9 @@ async function runFullProtocolFlow(email) {
         throw e;
     } finally {
         if (browser) await browser.close();
+        if (proxyBridge) {
+            await stopLocalPlaywrightProxyBridge(proxyBridge).catch(() => { });
+        }
     }
 }
 

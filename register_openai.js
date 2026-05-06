@@ -6,6 +6,11 @@ const path = require('path');
 const { getImapAuthHeaders } = require('./imap-auth');
 const { fetchLatestOpenAiOtpOnce } = require('./pool-email-imap');
 const inboxEmail = require('./inbox-email');
+const {
+    needsPlaywrightProxyBridge,
+    startLocalPlaywrightProxyBridge,
+    stopLocalPlaywrightProxyBridge
+} = require('./playwright-proxy-bridge');
 
 // 使用 stealth 插件
 chromium.use(stealth);
@@ -1036,6 +1041,7 @@ async function runRegistrationFlow() {
 
     const emailSource = String(process.env.EMAIL_SOURCE || 'random').toLowerCase();
     const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
+    const inboxAdminPassword = String(process.env.INBOX_ADMIN_PASSWORD || '').trim();
     const inboxEmailDomain = String(process.env.INBOX_EMAIL_DOMAIN || '').trim().replace(/^@/, '');
     // 多域名候选：每次随机挑一个，避免单一域名被风控/限频
     const inboxEmailDomainsList = String(process.env.INBOX_EMAIL_DOMAINS || '')
@@ -1082,6 +1088,7 @@ async function runRegistrationFlow() {
             try {
                 const newInbox = await inboxEmail.createAddress({
                     baseUrl: inboxApiBase,
+                    adminPassword: inboxAdminPassword,
                     domain: tryDomain || undefined
                 });
                 email = newInbox.address;
@@ -1101,8 +1108,7 @@ async function runRegistrationFlow() {
         }
 
         if (!email) {
-            // 所有候选都失败了，干脆抛错，让父进程换号重试
-            throw new Error(`Inbox 临时邮箱创建失败：所有候选域名均不可用 (${tryOrder.filter(Boolean).join(', ')})`);
+            throw new Error(`CF Worker 临时邮箱创建失败：所有候选域名均不可用 (${tryOrder.filter(Boolean).join(', ')})`);
         }
 
         const domainHint = inboxEmailDomainsList.length > 0
@@ -1121,6 +1127,7 @@ async function runRegistrationFlow() {
 
     let browser;
     let page = null;
+    let proxyBridge = null;
     try {
         if (DEBUG_HEADFUL) {
             console.log(`🧪 [Step 0] 启动 Stealth 浏览器环境... (HEADFUL=1，有头模式${CHROMIUM_CHANNEL ? `, channel=${CHROMIUM_CHANNEL}` : ''})`);
@@ -1138,10 +1145,17 @@ async function runRegistrationFlow() {
             launchOptions.channel = CHROMIUM_CHANNEL; // 'chrome' / 'msedge'
         }
 
-        const proxyConfig = buildPlaywrightProxy(proxyValue);
+        let playwrightProxyValue = proxyValue;
+        if (needsPlaywrightProxyBridge(proxyValue)) {
+            proxyBridge = await startLocalPlaywrightProxyBridge(proxyValue);
+            playwrightProxyValue = proxyBridge.localProxyUrl;
+            console.log('🌉 [系统] 已为带认证 SOCKS5 代理创建本地匿名桥接');
+        }
+
+        const proxyConfig = buildPlaywrightProxy(playwrightProxyValue);
         if (proxyConfig) {
             launchOptions.proxy = proxyConfig;
-            const _proxyHost = (() => { try { return new URL(proxyValue).host; } catch (_) { return '已配置'; } })();
+            const _proxyHost = (() => { try { return new URL(playwrightProxyValue).host; } catch (_) { return '已配置'; } })();
             console.log(`🌐 [系统] 代理已配置`);
         } else {
             console.log("🌐 [系统] 未配置代理，使用本机出口直连。");
@@ -1923,6 +1937,9 @@ async function runRegistrationFlow() {
         }
 
         if (browser) await browser.close();
+        if (proxyBridge) {
+            await stopLocalPlaywrightProxyBridge(proxyBridge).catch(() => { });
+        }
         throw e;
     }
 }

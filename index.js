@@ -3,6 +3,11 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const ChatGPTService = require('./chatgpt');
 const fs = require('fs');
 const path = require('path');
+const {
+    needsPlaywrightProxyBridge,
+    startLocalPlaywrightProxyBridge,
+    stopLocalPlaywrightProxyBridge
+} = require('./playwright-proxy-bridge');
 chromium.use(StealthPlugin());
 // 启用 Stealth 插件（在任何 launch 之前调用）
 
@@ -167,13 +172,21 @@ async function run() {
     if (DEBUG_HEADFUL) {
         console.log(`🧪 [Step 0] 启动 Stealth 浏览器环境... (HEADFUL=1，有头模式${CHROMIUM_CHANNEL ? `, channel=${CHROMIUM_CHANNEL}` : ''})`);
     }
-    const proxyConfig = buildPlaywrightProxy(CONFIG.proxy);
+    let proxyBridge = null;
+    let playwrightProxyValue = CONFIG.proxy;
+    if (needsPlaywrightProxyBridge(CONFIG.proxy)) {
+        proxyBridge = await startLocalPlaywrightProxyBridge(CONFIG.proxy);
+        playwrightProxyValue = proxyBridge.localProxyUrl;
+        console.log('🌉 [系统] 已为带认证 SOCKS5 代理创建本地匿名桥接');
+    }
+
+    const proxyConfig = buildPlaywrightProxy(playwrightProxyValue);
 
     if (proxyConfig) {
         launchOptions.proxy = proxyConfig;
         // 代理详情不再打印（避免泄露凭证 + 减少噪音）
         const _proxyHost = (() => {
-            try { return new URL(CONFIG.proxy).host; } catch (_) { return '已配置'; }
+            try { return new URL(playwrightProxyValue).host; } catch (_) { return '已配置'; }
         })();
         console.log(`🌐 [系统] 代理已配置`);
     }
@@ -1858,6 +1871,9 @@ async function run() {
         if (stopInactivityWatcher) stopInactivityWatcher();
         console.log("👋 [系统] 流程结束，正在关闭浏览器...");
         await browser.close().catch(() => { });
+        if (proxyBridge) {
+            await stopLocalPlaywrightProxyBridge(proxyBridge).catch(() => { });
+        }
     }
 }
 
