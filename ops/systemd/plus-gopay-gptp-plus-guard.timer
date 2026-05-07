@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic guard for plus_gopay_gptp_plus stack and register.lovelymira.com ingress
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=15s
+Unit=plus-gopay-gptp-plus-guard.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -26,6 +26,9 @@
     </section>
 
     <main class="glass-container">
+        <div class="top-entry-bar">
+            <a class="top-entry-link" href="/format-converter.html">格式转换</a>
+        </div>
         <div class="main-title">FLYGPT PLUS</div>
         <nav class="tab-nav">
             <button class="tab-btn active" data-tab="redeem">CDK 兑换</button>
@@ -255,12 +258,9 @@
                 document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 const tab = btn.dataset.tab;
-                if (tab === 'redeem') {
-                    redeemSection.style.display = 'block';
-                    querySection.style.display = 'none';
-                } else {
-                    redeemSection.style.display = 'none';
-                    querySection.style.display = 'block';
+                redeemSection.style.display = tab === 'redeem' ? 'block' : 'none';
+                querySection.style.display = tab === 'query' ? 'block' : 'none';
+                if (tab !== 'redeem') {
                     hideProgress();
                 }
                 statusMsg.style.display = 'none';
@@ -657,7 +657,7 @@
                     clearProductHeartbeat();
                     productSocket = null;
                     if (activeJobKey === jobKey && !taskCompleted) {
-                        showStatus('连接中断，正在重连...', 'error');
+                        showStatus('连接中断，正在重连...后台任务仍在服务器继续运行，可在后台任务管理中手动停止。', 'error');
                         clearTimeout(productReconnectTimer);
                         productReconnectTimer = setTimeout(connectProductSocket, 3000);
                     }
@@ -868,6 +868,7 @@
                 socket = null;
                 // 只有在任务还未结束时才尝试重连
                 if (activeJobKey && !taskCompleted) {
+                    showStatus('连接中断，正在重连...后台任务仍在服务器继续运行，可在后台任务管理中手动停止。', 'error');
                     clearTimeout(reconnectTimer);
                     reconnectTimer = setTimeout(() => initWebSocket(activeJobKey), 3000);
                 }
@@ -1027,6 +1028,7 @@
 
         loadPublicRuntime();
         publicRuntimeTimer = setInterval(loadPublicRuntime, 3000);
+
 
         lucide.createIcons();
     </script>

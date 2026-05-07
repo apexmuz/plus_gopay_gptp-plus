@@ -9,7 +9,12 @@ const axios = require('axios');
 const store = require('./mysql-store');
 const { listRecentEmailsForAdmin } = require('./pool-email-imap');
 const runtimeLog = require('./runtime-log');
-const { initializeImapAuth, getImapAuthHeaders } = require('./imap-auth');
+const {
+    createStopController,
+    sleep,
+    sleepWithStop,
+    waitForAvailableActivationSlot
+} = require('./admin-generation-control');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -19,9 +24,9 @@ const PROCESS_IDLE_TIMEOUT_MS = 60 * 1000;
 const MAX_PROCESS_ATTEMPTS = 10;
 const WS_HEARTBEAT_PING_TYPE = 'ping';
 const WS_HEARTBEAT_PONG_TYPE = 'pong';
-const ACCESS_DEACTIVATED_MESSAGES_URL = 'https://imap.chiyiyi.cloud/api/admin/access-deactivated-messages';
 const ACCESS_DEACTIVATED_SYNC_KEY = 'access_deactivated_messages_last_since';
 const ACCESS_DEACTIVATED_SYNC_COOLDOWN_MS = 30 * 1000;
+const ACCESS_DEACTIVATED_SYNC_REASON = 'disabled_cf_worker_only';
 const ADMIN_TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET || crypto
     .createHash('sha256')
     .update(`web_redeem:${process.cwd()}:admin-token-secret`)
@@ -47,6 +52,8 @@ const activeBackgroundJobs = new Set();
 
 /** 后台成品批量生产：job_key -> 停止回调（将批次 aborted 置 true） */
 const adminGenerationStopHandlers = new Map();
+/** 前台成品 / 自助开通：job_key -> 停止回调 */
+const runtimeTaskStopHandlers = new Map();
 
 function registerAdminGenerationStop(jobKey, fn) {
     adminGenerationStopHandlers.set(String(jobKey), fn);
@@ -56,13 +63,51 @@ function unregisterAdminGenerationStop(jobKey) {
     adminGenerationStopHandlers.delete(String(jobKey));
 }
 
+function resolveStopHandlerByJobKey(handlerMap, jobKey) {
+    const normalizedKey = String(jobKey || '').trim();
+    if (!normalizedKey) {
+        return null;
+    }
+    if (handlerMap.has(normalizedKey)) {
+        return handlerMap.get(normalizedKey);
+    }
+    const candidateKeys = Array.from(handlerMap.keys());
+    const matches = candidateKeys.filter((key) => key === normalizedKey || key.endsWith(normalizedKey));
+    if (!matches.length) {
+        return null;
+    }
+    matches.sort((a, b) => b.length - a.length);
+    return handlerMap.get(matches[0]) || null;
+}
+
 function requestAdminGenerationStop(jobKey) {
-    const fn = adminGenerationStopHandlers.get(String(jobKey));
+    const fn = resolveStopHandlerByJobKey(adminGenerationStopHandlers, jobKey);
     if (typeof fn !== 'function') {
         return false;
     }
     try {
-        fn();
+        Promise.resolve(fn()).catch(() => { });
+    } catch (_) {
+        /* ignore */
+    }
+    return true;
+}
+
+function registerRuntimeTaskStop(jobKey, fn) {
+    runtimeTaskStopHandlers.set(String(jobKey), fn);
+}
+
+function unregisterRuntimeTaskStop(jobKey) {
+    runtimeTaskStopHandlers.delete(String(jobKey));
+}
+
+function requestRuntimeTaskStop(jobKey) {
+    const fn = resolveStopHandlerByJobKey(runtimeTaskStopHandlers, jobKey);
+    if (typeof fn !== 'function') {
+        return false;
+    }
+    try {
+        Promise.resolve(fn()).catch(() => { });
     } catch (_) {
         /* ignore */
     }
@@ -98,10 +143,6 @@ function getTotalActiveJobs() {
     return activeForegroundJobs.size + activeBackgroundJobs.size;
 }
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function getClientIp(req) {
     const forwarded = String(req.headers['x-forwarded-for'] || '').trim();
     const rawIp = forwarded ? forwarded.split(',')[0].trim() : (req.ip || req.socket?.remoteAddress || '');
@@ -124,6 +165,29 @@ function getRemainingCooldownMinutes(cooldownUntil) {
 
 function isNoActivationEligibilityMessage(message) {
     return String(message || '').includes('无激活权限');
+}
+
+async function ensureRuntimeAssetsReadyForActivation() {
+    const runtimeAssets = await store.getRuntimeAssets();
+    const phone = String(runtimeAssets?.phone?.phone || '').trim();
+    const phoneKey = String(runtimeAssets?.phone?.key || '').trim();
+    const cardNumber = String(runtimeAssets?.card?.number || '').trim();
+    const cardExpiry = String(runtimeAssets?.card?.expiry || '').trim();
+    const cardCvc = String(runtimeAssets?.card?.cvc || '').trim();
+
+    const missing = [];
+    if (!phone || phone === '未配置' || !phoneKey) {
+        missing.push('手机号');
+    }
+    if (!cardNumber || !cardExpiry || !cardCvc) {
+        missing.push('银行卡');
+    }
+
+    if (missing.length > 0) {
+        throw new Error(`系统未配置可用${missing.join('和')}资产，请先在后台补充后再试`);
+    }
+
+    return runtimeAssets;
 }
 
 function parseFlexibleTimestamp(value) {
@@ -200,104 +264,31 @@ async function syncAccessDeactivatedProductStatuses(force = false) {
     }
 
     accessDeactivatedSyncPromise = (async () => {
-        const previousSinceValue = await store.getAppConfigValue(ACCESS_DEACTIVATED_SYNC_KEY, '');
-        const previousSinceTs = parseFlexibleTimestamp(previousSinceValue);
-        const params = {};
-        if (previousSinceTs) {
-            params.since = String(previousSinceTs);
-        }
-
-        try {
-            const response = await axios.get(ACCESS_DEACTIVATED_MESSAGES_URL, {
-                headers: await getImapAuthHeaders(),
-                params,
-                timeout: 30000
-            });
-
-            const messages = Array.isArray(response?.data?.messages) ? response.data.messages : [];
-            const emailSet = new Set();
-            let latestMessageTs = previousSinceTs;
-
-            for (const message of messages) {
-                for (const email of collectMessageEmails(message)) {
-                    emailSet.add(email);
-                }
-                const messageTs = parseFlexibleTimestamp(message?.date);
-                if (messageTs && (!latestMessageTs || messageTs > latestMessageTs)) {
-                    latestMessageTs = messageTs;
-                }
-            }
-
-            const affectedRows = await store.updateProductStatusByEmails([...emailSet], '封禁');
-            const nextSinceTs = latestMessageTs || now;
-            await store.setAppConfigValue(ACCESS_DEACTIVATED_SYNC_KEY, String(nextSinceTs));
-            accessDeactivatedLastSyncAt = Date.now();
-
-            if (messages.length > 0 || affectedRows > 0) {
-                console.log(`[AccessDeactivated] synced messages=${messages.length} matchedEmails=${emailSet.size} updatedProducts=${affectedRows} since=${previousSinceTs || 'all'} nextSince=${nextSinceTs}`);
-            }
-
-            return {
-                messagesCount: messages.length,
-                matchedEmails: emailSet.size,
-                updatedProducts: affectedRows,
-                previousSinceTs,
-                nextSinceTs
-            };
-        } catch (error) {
-            const isUnauthorized = Number(error?.response?.status || 0) === 401;
-            if (isUnauthorized) {
-                try {
-                    const retryResponse = await axios.get(ACCESS_DEACTIVATED_MESSAGES_URL, {
-                        headers: await getImapAuthHeaders(true),
-                        params,
-                        timeout: 30000
-                    });
-
-                    const retryMessages = Array.isArray(retryResponse?.data?.messages) ? retryResponse.data.messages : [];
-                    const retryEmailSet = new Set();
-                    let latestMessageTs = previousSinceTs;
-
-                    for (const message of retryMessages) {
-                        for (const email of collectMessageEmails(message)) {
-                            retryEmailSet.add(email);
-                        }
-                        const messageTs = parseFlexibleTimestamp(message?.date);
-                        if (messageTs && (!latestMessageTs || messageTs > latestMessageTs)) {
-                            latestMessageTs = messageTs;
-                        }
-                    }
-
-                    const affectedRows = await store.updateProductStatusByEmails([...retryEmailSet], '封禁');
-                    const nextSinceTs = latestMessageTs || now;
-                    await store.setAppConfigValue(ACCESS_DEACTIVATED_SYNC_KEY, String(nextSinceTs));
-                    accessDeactivatedLastSyncAt = Date.now();
-
-                    if (retryMessages.length > 0 || affectedRows > 0) {
-                        console.log(`[AccessDeactivated] synced after token refresh messages=${retryMessages.length} matchedEmails=${retryEmailSet.size} updatedProducts=${affectedRows} since=${previousSinceTs || 'all'} nextSince=${nextSinceTs}`);
-                    }
-
-                    return {
-                        messagesCount: retryMessages.length,
-                        matchedEmails: retryEmailSet.size,
-                        updatedProducts: affectedRows,
-                        previousSinceTs,
-                        nextSinceTs
-                    };
-                } catch (retryError) {
-                    console.error(`[AccessDeactivated] sync failed after token refresh: ${retryError.message}`);
-                    throw retryError;
-                }
-            }
-
-            console.error(`[AccessDeactivated] sync failed: ${error.message}`);
-            throw error;
-        } finally {
-            accessDeactivatedSyncPromise = null;
-        }
+        accessDeactivatedLastSyncAt = Date.now();
+        return {
+            skipped: true,
+            reason: ACCESS_DEACTIVATED_SYNC_REASON
+        };
     })();
 
-    return accessDeactivatedSyncPromise;
+    try {
+        return await accessDeactivatedSyncPromise;
+    } finally {
+        accessDeactivatedSyncPromise = null;
+    }
+}
+
+async function syncAccessDeactivatedProductStatusesSafely(force = false, source = 'request') {
+    try {
+        return await syncAccessDeactivatedProductStatuses(force);
+    } catch (error) {
+        console.error(`[AccessDeactivated] ${source} sync skipped: ${error.message}`);
+        return {
+            skipped: true,
+            reason: 'sync_error',
+            error: error.message
+        };
+    }
 }
 
 function scheduleAccessDeactivatedSync(delayMs = ACCESS_DEACTIVATED_SYNC_COOLDOWN_MS) {
@@ -316,22 +307,6 @@ function scheduleAccessDeactivatedSync(delayMs = ACCESS_DEACTIVATED_SYNC_COOLDOW
             scheduleAccessDeactivatedSync(ACCESS_DEACTIVATED_SYNC_COOLDOWN_MS);
         }
     }, Math.max(1000, Number(delayMs) || ACCESS_DEACTIVATED_SYNC_COOLDOWN_MS));
-}
-
-async function waitForAvailableActivationSlot(jobSet, maxConcurrentActivations, excludedSlotKeys = []) {
-    const excluded = new Set((excludedSlotKeys || []).map((item) => String(item)));
-    while (true) {
-        let occupied = 0;
-        for (const slot of jobSet) {
-            if (!excluded.has(String(slot))) {
-                occupied += 1;
-            }
-        }
-        if (occupied < Math.max(1, Number(maxConcurrentActivations) || 1)) {
-            return;
-        }
-        await sleep(1000);
-    }
 }
 
 function isFatalProductGenerationError(error) {
@@ -552,10 +527,31 @@ async function startAdminProductGenerationTask(count, options = {}) {
     let lastError = '';
     let lastProgress = 1;
     let aborted = false;
+    const stopController = createStopController();
+    const stopRequestedMessage = '管理员请求停止：本批次不再排队新的成品生产（当前正在执行的条次会尽快停止并退出）';
 
-    registerAdminGenerationStop(task.jobKey, () => {
-        aborted = true;
-        logTask(task.jobKey, '管理员请求停止：本批次不再排队新的成品生产（当前正在执行的条次会尽快在步骤间隙退出）', 'warn');
+    registerAdminGenerationStop(task.jobKey, async () => {
+        const didStop = stopController.stop(stopRequestedMessage);
+        aborted = stopController.stopped;
+        if (!didStop) {
+            return;
+        }
+        lastError = stopController.reason || stopRequestedMessage;
+        logTask(task.jobKey, stopRequestedMessage, 'warn');
+        await store.updateTaskLog(task.jobKey, {
+            status: 'running',
+            message: stopRequestedMessage,
+            rawOutput: buildGenerationSummary(),
+            cdkCode: `ADMIN_PRODUCT_GEN:${targetCount}`,
+            progress: computeBatchProgress()
+        });
+        broadcastToTask(task.jobKey, {
+            type: 'progress',
+            jobKey: task.jobKey,
+            progress: computeBatchProgress(),
+            status: 'running',
+            message: stopRequestedMessage
+        });
     });
 
     const buildGenerationSummary = () => JSON.stringify({
@@ -602,7 +598,7 @@ async function startAdminProductGenerationTask(count, options = {}) {
     (async () => {
         const worker = async () => {
             while (true) {
-                if (aborted) {
+                if (aborted || stopController.stopped) {
                     return;
                 }
                 const currentIndex = nextIndex;
@@ -613,13 +609,14 @@ async function startAdminProductGenerationTask(count, options = {}) {
 
                 const slotKey = `${task.jobKey}:item:${currentIndex}`;
                 itemProgress.set(currentIndex, 0);
+                let itemCompleted = false;
 
                 try {
                     let produced = false;
                     let attempt = 0;
 
                     while (!produced) {
-                        if (aborted) {
+                        if (aborted || stopController.stopped) {
                             return;
                         }
 
@@ -631,7 +628,12 @@ async function startAdminProductGenerationTask(count, options = {}) {
                                 : `正在生产第 ${currentIndex}/${targetCount} 个成品号...`
                         );
 
-                        await waitForAvailableActivationSlot(activeBackgroundJobs, maxConcurrentActivations);
+                        const acquired = await waitForAvailableActivationSlot(activeBackgroundJobs, maxConcurrentActivations, {
+                            stopController
+                        });
+                        if (!acquired || aborted || stopController.stopped) {
+                            return;
+                        }
                         reserveBackgroundSlot(slotKey);
 
                         try {
@@ -640,18 +642,26 @@ async function startAdminProductGenerationTask(count, options = {}) {
                                 itemProgress.set(currentIndex, Math.max(0, Math.min(99, Number(progressData.progress) || 0)));
                                 const itemMessage = progressData.message || `正在生产第 ${currentIndex}/${targetCount} 个成品号...`;
                                 await publishBatchProgress(`第 ${currentIndex}/${targetCount} 个: ${itemMessage}`);
-                            }, { jobKey: task.jobKey });
+                            }, {
+                                jobKey: task.jobKey,
+                                stopController
+                            });
 
                             if (result?.success) {
                                 await store.addProduct(result.email, result.sub2apiPath || result.sub2apiFile || '', null, null, result.imapKey || null);
                                 successCount += 1;
                                 produced = true;
+                                itemCompleted = true;
                                 logTask(task.jobKey, `第 ${currentIndex}/${targetCount} 个成品号生产成功 email=${result.email}`);
                             } else {
                                 throw new Error('未返回成功结果');
                             }
                         } catch (error) {
                             lastError = error.message || '未知错误';
+                            if (stopController.stopped) {
+                                aborted = true;
+                                throw error;
+                            }
                             if (isFatalProductGenerationError(error)) {
                                 failedCount += 1;
                                 aborted = true;
@@ -667,9 +677,18 @@ async function startAdminProductGenerationTask(count, options = {}) {
                         }
                     }
                 } finally {
-                    if (!aborted) {
+                    itemProgress.delete(currentIndex);
+                    if (itemCompleted) {
                         completed += 1;
-                        itemProgress.delete(currentIndex);
+                        await publishBatchProgress(
+                            aborted || stopController.stopped
+                                ? `已收到停止指令，当前已完成 ${completed}/${targetCount}，任务即将结束...`
+                                : completed >= targetCount
+                                    ? '生产任务收尾中...'
+                                    : `已完成 ${completed}/${targetCount}，继续生产剩余成品号...`
+                        );
+                    } else if (!aborted && !stopController.stopped) {
+                        completed += 1;
                         await publishBatchProgress(
                             completed >= targetCount
                                 ? '生产任务收尾中...'
@@ -686,7 +705,9 @@ async function startAdminProductGenerationTask(count, options = {}) {
             const finalStatus = aborted || failedCount > 0 ? 'failed' : 'success';
             const finalMessage = finalStatus === 'success'
                 ? `成功生产 ${successCount} 个成品号`
-                : `生产中止，已成功 ${successCount} 个${lastError ? `，原因：${lastError}` : ''}`;
+                : stopController.stopped
+                    ? `任务已手动停止，已成功 ${successCount} 个`
+                    : `生产中止，已成功 ${successCount} 个${lastError ? `，原因：${lastError}` : ''}`;
             const finalProgress = 100;
 
             await store.updateTaskLog(task.jobKey, {
@@ -1061,6 +1082,19 @@ function analyzeProcessOutput(output, timedOut) {
         };
     }
 
+    if ((normalized.includes('获取 PayPal 链接异常')
+        || normalized.includes('无法获取 PayPal 审批链接'))
+        && /EPROTO|packet length too long|tls_|SSL routines|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|socket hang up/i.test(normalized)) {
+        return {
+            status: 'failed',
+            message: '支付链接创建失败：代理或网络 TLS 异常，请检查代理链路后重试',
+            reachedPaypal: false,
+            shouldRetry: false,
+            deletePhone: false,
+            deleteCard: false
+        };
+    }
+
     if (normalized.includes('金额校验失败')
         || normalized.includes('Missing PayPal approval URL / ba_token')
         || normalized.includes('多次尝试后仍未获取到 PayPal 重定向 URL')
@@ -1147,10 +1181,10 @@ function analyzeProcessOutput(output, timedOut) {
 
     if (normalized.includes('支付结果检测失败')) {
         return {
-            status: 'retry',
-            message: '支付检测失败，准备重试',
+            status: 'failed',
+            message: '支付结果检测失败，请人工核查后再决定是否重试',
             reachedPaypal: true,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -1160,10 +1194,10 @@ function analyzeProcessOutput(output, timedOut) {
         || normalized.includes('支付失败 (stripe_redirect_canceled)')
         || normalized.includes('支付失败 (paypal_blocked)')) {
         return {
-            status: 'retry',
-            message: 'PayPal/Stripe 端驳回支付，准备换号重试',
+            status: 'failed',
+            message: 'PayPal/Stripe 端驳回支付，本次任务终止',
             reachedPaypal: true,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -1171,17 +1205,19 @@ function analyzeProcessOutput(output, timedOut) {
 
     if (normalized.includes('PayPal 未渲染创建账户表单')) {
         return {
-            status: 'retry',
-            message: 'PayPal 仅渲染欢迎页，已多次刷新仍无表单，准备同号重试',
+            status: 'failed',
+            message: 'PayPal 仅渲染欢迎页，已多次刷新仍无表单，本次任务终止',
             reachedPaypal: false,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
     }
 
     if (normalized.includes('代理或网络持续超时')
-        || normalized.includes('浏览器连接被代理多次关闭')) {
+        || normalized.includes('浏览器连接被代理多次关闭')
+        || normalized.includes('apiRequestContext.get: Parse Error')
+        || normalized.includes('Parse Error: Expected HTTP/, RTSP/ or ICE/')) {
         return {
             status: 'retry',
             message: '当前代理超时严重，已切换代理重试',
@@ -1261,7 +1297,7 @@ function analyzeProcessOutput(output, timedOut) {
             status: 'failed',
             message: '激活失败',
             reachedPaypal,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -1349,7 +1385,7 @@ function normalizeTaskProgress(progress, status = 'running', previous = 0) {
     return Math.max(Math.max(0, Number(previous) || 0), cappedProgress);
 }
 
-function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = null) {
+function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = null, stopController = null) {
     return new Promise((resolve) => {
         logTask(jobKey, `启动子进程 attempt=${attempt} script=${scriptPath}`);
         const child = spawn('node', [scriptPath], {
@@ -1361,6 +1397,8 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
         let idleTimer = null;
         let finished = false;
         let timedOut = false;
+        let childExited = false;
+        let stopWatcherActive = true;
 
         activeProcesses.add(child);
         const cleanup = () => {
@@ -1376,6 +1414,20 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
             cleanup();
             resolve({ attempt, ...result });
         };
+
+        if (stopController) {
+            stopController.waitForStop().then(() => {
+                if (!stopWatcherActive || finished || childExited) {
+                    return;
+                }
+                const stopReason = stopController.reason || '管理员请求停止任务';
+                output += `\n[STOPPED] ${stopReason}\n`;
+                logTask(jobKey, `attempt=${attempt} 收到停止指令，终止子进程`, 'warn');
+                try {
+                    child.kill('SIGKILL');
+                } catch (_) { }
+            }).catch(() => { });
+        }
 
         const resetIdleTimer = () => {
             if (idleTimer) {
@@ -1407,6 +1459,8 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
             logTask(jobKey, `attempt=${attempt} 子进程启动失败: ${error.message}`, 'error');
         });
         child.on('close', (code, signal) => {
+            childExited = true;
+            stopWatcherActive = false;
             cleanup();
             logTask(jobKey, `attempt=${attempt} 子进程退出 code=${code} signal=${signal || 'none'} timedOut=${timedOut}`);
             finish({
@@ -1414,7 +1468,19 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
                 signal,
                 timedOut,
                 output,
-                analysis: analyzeProcessOutput(output, timedOut)
+                analysis: stopController?.stopped
+                    ? buildRuntimeFailure(
+                        stopController.reason || '管理员请求停止任务',
+                        'TASK_STOPPED',
+                        'failed',
+                        {
+                            reachedPaypal: false,
+                            shouldRetry: false,
+                            deletePhone: false,
+                            deleteCard: false
+                        }
+                    )
+                    : analyzeProcessOutput(output, timedOut)
             });
         });
     });
@@ -1506,6 +1572,27 @@ app.post('/api/admin/products/generate-stop', authenticateAdmin, async (req, res
             message: stopped > 0
                 ? `已向 ${stopped} 个后台批次发送停止指令`
                 : '当前没有在本进程内登记的后台成品批量任务（若任务刚结束请在任务管理中刷新列表）'
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/task-logs/:jobKey/stop', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const jobKey = decodeURIComponent(String(req.params.jobKey || '').trim());
+        if (!jobKey) {
+            return res.status(400).json({ success: false, message: '缺少任务标识' });
+        }
+
+        const stopped = requestRuntimeTaskStop(jobKey) || requestAdminGenerationStop(jobKey);
+        return res.json({
+            success: true,
+            stopped: stopped ? 1 : 0,
+            message: stopped
+                ? '已发送停止指令，任务会在当前安全步骤尽快退出'
+                : '未找到该 Job 的运行中任务，可能已结束或未在本进程启动'
         });
     } catch (error) {
         return res.status(500).json({ success: false, message: error.message });
@@ -1691,7 +1778,7 @@ app.get('/api/admin/session', (req, res) => {
 app.get('/api/admin/data', async (req, res) => {
     try {
         await ensureStoreReady();
-        await syncAccessDeactivatedProductStatuses();
+        await syncAccessDeactivatedProductStatusesSafely(false, 'admin data');
         const data = await store.getAdminData();
         const system = await getSystemMetrics();
         data.runtime = {
@@ -1843,7 +1930,7 @@ app.delete('/api/admin/cdks/:cdk', async (req, res) => {
 app.get('/api/admin/products', async (req, res) => {
     try {
         await ensureStoreReady();
-        await syncAccessDeactivatedProductStatuses();
+        await syncAccessDeactivatedProductStatusesSafely(false, 'admin products');
         res.json(await store.listProducts());
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -2154,6 +2241,7 @@ app.post('/api/redeem-product', async (req, res) => {
                 });
             }
         }
+        await ensureRuntimeAssetsReadyForActivation();
 
         // 锁定 CDK
         const lockSuccess = await store.markCdkUsed(cdk);
@@ -2168,9 +2256,30 @@ app.post('/api/redeem-product', async (req, res) => {
             status: 'running',
             progress: 5
         });
+        const stopController = createStopController();
+        const stopRequestedMessage = '管理员请求停止：当前成品创建任务将尽快终止';
 
         reserveForegroundSlot(task.jobKey);
         logTask(task.jobKey, `成品号创建流程启动, CDK=${cdk}`);
+        registerRuntimeTaskStop(task.jobKey, async () => {
+            const didStop = stopController.stop(stopRequestedMessage);
+            if (!didStop) {
+                return;
+            }
+            logTask(task.jobKey, stopRequestedMessage, 'warn');
+            await store.updateTaskLog(task.jobKey, {
+                status: 'running',
+                message: stopRequestedMessage,
+                progress: 99
+            });
+            broadcastToTask(task.jobKey, {
+                type: 'progress',
+                jobKey: task.jobKey,
+                progress: 99,
+                status: 'running',
+                message: stopRequestedMessage
+            });
+        });
 
         // 异步启动流程
         (async () => {
@@ -2197,7 +2306,11 @@ app.post('/api/redeem-product', async (req, res) => {
                         cardLast4: progressData.cardLast4 || null,
                         cardExpiry: progressData.cardExpiry || null
                     });
-                }, { jobKey: task.jobKey });
+                }, {
+                    jobKey: task.jobKey,
+                    stopController,
+                    singleRun: true
+                });
 
                 if (result.success) {
                     shouldRollbackCdk = false;
@@ -2226,6 +2339,10 @@ app.post('/api/redeem-product', async (req, res) => {
                 }
             } catch (error) {
                 console.error(`[ProductTask] Error:`, error);
+                const isStopped = stopController.stopped || String(error.message || '').includes('管理员请求停止');
+                const failureMessage = isStopped
+                    ? (stopController.reason || stopRequestedMessage)
+                    : `创建失败: ${error.message}`;
 
                 if (shouldRollbackCdk) {
                     await store.markCdkUnused(cdk);
@@ -2242,7 +2359,7 @@ app.post('/api/redeem-product', async (req, res) => {
 
                 await store.updateTaskLog(task.jobKey, {
                     status: 'failed',
-                    message: `创建失败: ${error.message}`,
+                    message: failureMessage,
                     progress: 100
                 });
                 broadcastToTask(task.jobKey, {
@@ -2250,10 +2367,11 @@ app.post('/api/redeem-product', async (req, res) => {
                     jobKey: task.jobKey,
                     progress: 100,
                     status: 'failed',
-                    message: `创建失败: ${error.message}`
+                    message: failureMessage
                 });
             } finally {
                 releaseForegroundSlot(task.jobKey);
+                unregisterRuntimeTaskStop(task.jobKey);
             }
         })();
 
@@ -2352,6 +2470,7 @@ app.post('/api/run-process', async (req, res) => {
                 });
             }
         }
+        await ensureRuntimeAssetsReadyForActivation();
 
         const lockSuccess = await store.markCdkUsed(cdk);
         if (!lockSuccess) {
@@ -2366,9 +2485,32 @@ app.post('/api/run-process', async (req, res) => {
             status: 'running',
             progress: 3
         });
+        const stopController = createStopController();
+        const stopRequestedMessage = '管理员请求停止：当前开通任务将尽快终止';
 
         logTask(task.jobKey, `任务已创建，CDK=${cdk}`);
         reserveForegroundSlot(task.jobKey);
+        registerRuntimeTaskStop(task.jobKey, async () => {
+            const didStop = stopController.stop(stopRequestedMessage);
+            if (!didStop) {
+                return;
+            }
+            logTask(task.jobKey, stopRequestedMessage, 'warn');
+            await store.updateTaskLog(task.jobKey, {
+                status: 'running',
+                message: stopRequestedMessage,
+                cdkCode: cdk,
+                progress: 99
+            });
+            broadcastToTask(task.jobKey, {
+                type: 'progress',
+                jobKey: task.jobKey,
+                progress: 99,
+                status: 'running',
+                message: stopRequestedMessage,
+                cdkCode: cdk
+            });
+        });
 
         // 异步执行，不阻塞响应
         (async () => {
@@ -2414,7 +2556,19 @@ app.post('/api/run-process', async (req, res) => {
                             message: '资产池暂时被占用，正在排队等待空闲手机号/银行卡...',
                             cdkCode: cdk
                         });
-                        await sleep(10000);
+                        const keepWaiting = await sleepWithStop(10000, { stopController });
+                        if (!keepWaiting) {
+                            break;
+                        }
+                    }
+
+                    if (stopController.stopped) {
+                        finalRun = {
+                            attempt,
+                            output: allOutputs.join('\n'),
+                            analysis: buildRuntimeFailure(stopController.reason || stopRequestedMessage, 'TASK_STOPPED')
+                        };
+                        break;
                     }
 
                     if (!assets) {
@@ -2466,7 +2620,7 @@ app.post('/api/run-process', async (req, res) => {
                                 cdkCode: cdk
                             });
                         }
-                    });
+                    }, stopController);
                     allOutputs.push(`===== ATTEMPT ${attempt} | PHONE ${assets.phone.phone} | CARD ${assets.card.number.slice(-4)} =====\n${run.output}`);
                     finalRun = { ...run, output: allOutputs.join('\n\n') };
 
@@ -2609,10 +2763,14 @@ app.post('/api/run-process', async (req, res) => {
                 }
             } catch (bgError) {
                 console.error(`[Background Task Error] ${task.jobKey}:`, bgError);
-                logTask(task.jobKey, `后台任务异常: ${bgError.message}`, 'error');
+                const isStopped = stopController.stopped || String(bgError.message || '').includes('管理员请求停止');
+                const failureMessage = isStopped
+                    ? (stopController.reason || stopRequestedMessage)
+                    : bgError.message;
+                logTask(task.jobKey, isStopped ? failureMessage : `后台任务异常: ${bgError.message}`, isStopped ? 'warn' : 'error');
                 await store.updateTaskLog(task.jobKey, {
                     status: 'failed',
-                    message: bgError.message,
+                    message: failureMessage,
                     rawOutput: bgError.message,
                     cdkCode: cdk,
                     progress: normalizeTaskProgress(lastProgress, 'failed', lastProgress)
@@ -2621,7 +2779,7 @@ app.post('/api/run-process', async (req, res) => {
                     type: 'status',
                     jobKey: task.jobKey,
                     status: 'failed',
-                    message: bgError.message,
+                    message: failureMessage,
                     cdkCode: cdk,
                     progress: normalizeTaskProgress(lastProgress, 'failed', lastProgress)
                 });
@@ -2631,6 +2789,7 @@ app.post('/api/run-process', async (req, res) => {
                 }
             } finally {
                 releaseForegroundSlot(task.jobKey);
+                unregisterRuntimeTaskStop(task.jobKey);
                 if (getTotalActiveJobs() === 0) {
                     const maintenanceModeState = await store.getMaintenanceModeState();
                     if (maintenanceModeState.enabled && maintenanceModeState.drain) {
@@ -2813,14 +2972,8 @@ async function start() {
         }
     }, 60 * 1000).unref();
 
-    try {
-        await initializeImapAuth();
-        await syncAccessDeactivatedProductStatuses(true);
-        scheduleAccessDeactivatedSync();
-    } catch (error) {
-        console.error(`[IMAP] 项目启动预刷新失败: ${error.message}`);
-        scheduleAccessDeactivatedSync();
-    }
+    await syncAccessDeactivatedProductStatuses(true);
+    scheduleAccessDeactivatedSync();
 
     const server = app.listen(PORT, () => {
         const conn = store.connectionInfo;

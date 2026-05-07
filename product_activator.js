@@ -1,10 +1,9 @@
 const { runFullProtocolFlow } = require('./oauth_login');
 const { fork } = require('child_process');
 const path = require('path');
-const axios = require('axios');
 const store = require('./mysql-store');
 const runtimeLog = require('./runtime-log');
-const { getImapAuthHeaders, forceRefreshImapToken } = require('./imap-auth');
+const { sleep, sleepWithStop } = require('./admin-generation-control');
 
 const CONFIG = {
     MAX_ACCOUNT_RETRIES: 15,
@@ -15,7 +14,6 @@ const CONFIG = {
     CHILD_IDLE_TIMEOUT_MS: 60 * 1000
 };
 
-const IMAP_ADMIN_EMAIL_API = 'https://imap.chiyiyi.cloud/api/admin/emails';
 const OAUTH_ADD_PHONE_ERROR = '当前账号触发手机号验证';
 
 // 进程级 inbox 域名黑名单：被 API 拒绝过的域名，本进程内不再传给子进程
@@ -30,7 +28,7 @@ const REGISTRATION_PROGRESS_MARKERS = [
     ['[等待] 正在检测下一步流程', 12, '正在等待注册下一步流程...'],
     ['[Step 4.5] 检测到创建密码页面', 14, '正在设置账号密码...'],
     ['[Step 5] 正在从邮箱获取验证码', 16, '正在获取注册验证码...'],
-    ['[IMAP] 成功获取验证码', 17, '注册验证码已获取，准备提交...'],
+    ['[Inbox] 成功获取验证码', 17, '注册验证码已获取，准备提交...'],
     ['[Step 6] 正在完善个人资料', 18, '正在完善账号资料...'],
     ['[Wait] 正在等待聊天对话框出现', 19, '正在确认账号注册成功...'],
     ['[Step 7] 正在获取 Session 信息', 20, '正在获取 Access Token...'],
@@ -100,63 +98,49 @@ const PROTOCOL_PROGRESS_MARKERS = [
     ['[代理检查] 正在验证代理可用性', 86, '正在检查协议提取代理...'],
     ['[代理检查] 代理可用', 88, '协议提取代理可用...'],
     ['[Step 1] 正在处理授权登录', 90, '正在处理协议授权登录...'],
-    ['[IMAP] 正在为', 92, '正在获取协议验证码...'],
-    ['[IMAP] 成功获取验证码', 94, '协议验证码已获取...'],
+    ['[Inbox] 正在为', 92, '正在获取协议验证码...'],
+    ['[Inbox] 成功获取验证码', 94, '协议验证码已获取...'],
     ['[Step 2] 正在确认授权', 96, '正在确认协议授权...'],
     ['[Wait] 正在等待回调跳转', 98, '正在等待授权回调...'],
     ['[Step 3] 正在通过协议换取 Token Bundle', 99, '正在换取协议 Token Bundle...'],
     ['协议数据已按标准格式导出至', 100, '协议文件已导出，准备完成交付...']
 ];
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function throwIfStopped(stopController, fallbackMessage = '管理员请求停止任务') {
+    if (stopController?.stopped) {
+        throw new Error(stopController.reason || fallbackMessage);
+    }
 }
 
-async function generateImapKey(email) {
-    const normalizedEmail = String(email || '').trim();
-    if (!normalizedEmail) {
-        throw new Error('生成 IMAP Key 失败：缺少邮箱');
+function buildMissingRuntimeAssetMessage(runtimeAssets = {}) {
+    const missing = [];
+    const phone = String(runtimeAssets?.phone?.phone || '').trim();
+    const phoneKey = String(runtimeAssets?.phone?.key || '').trim();
+    const cardNumber = String(runtimeAssets?.card?.number || '').trim();
+    const cardExpiry = String(runtimeAssets?.card?.expiry || '').trim();
+    const cardCvc = String(runtimeAssets?.card?.cvc || '').trim();
+
+    if (!phone || phone === '未配置' || !phoneKey) {
+        missing.push('手机号');
+    }
+    if (!cardNumber || !cardExpiry || !cardCvc) {
+        missing.push('银行卡');
     }
 
-    let response;
-    try {
-        response = await axios.post(
-            IMAP_ADMIN_EMAIL_API,
-            { email: normalizedEmail },
-            {
-                headers: {
-                    ...(await getImapAuthHeaders()),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000
-            }
-        );
-    } catch (error) {
-        if (error.response && error.response.status === 401) {
-            console.error('[IMAP] 生成 Key 鉴权失败 (401)，正在自动刷新 Token 后重试...');
-            await forceRefreshImapToken();
-            response = await axios.post(
-                IMAP_ADMIN_EMAIL_API,
-                { email: normalizedEmail },
-                {
-                    headers: {
-                        ...(await getImapAuthHeaders()),
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 30000
-                }
-            );
-        } else {
-            throw error;
-        }
+    if (!missing.length) {
+        return '';
     }
 
-    const generatedKey = String(response?.data?.generatedKey || '').trim();
-    if (!generatedKey) {
-        throw new Error('生成 IMAP Key 失败：接口未返回 generatedKey');
-    }
+    return `系统未配置可用${missing.join('和')}资产，请先在后台补充后再试`;
+}
 
-    return generatedKey;
+async function ensureActivationAssetsAvailable() {
+    const runtimeAssets = await store.getRuntimeAssets();
+    const missingMessage = buildMissingRuntimeAssetMessage(runtimeAssets);
+    if (missingMessage) {
+        throw new Error(missingMessage);
+    }
+    return runtimeAssets;
 }
 
 function getStageProgress(markers, text, fallbackProgress = 0, fallbackMessage = '') {
@@ -216,12 +200,23 @@ function analyzeProcessOutput(output, timedOut) {
         };
     }
 
+    if ((normalized.includes('获取 PayPal 链接异常')
+        || normalized.includes('无法获取 PayPal 审批链接'))
+        && /EPROTO|packet length too long|tls_|SSL routines|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|socket hang up/i.test(normalized)) {
+        return {
+            status: 'failed',
+            message: '支付链接创建失败：代理或网络 TLS 异常，请检查代理链路后重试',
+            reachedPaypal: false,
+            shouldRetry: false,
+            deletePhone: false,
+            deleteCard: false
+        };
+    }
+
     const noPermissionKeywords = [
         'Missing PayPal approval URL',
         'Missing PayPal approval URL / ba_token',
         '多次尝试后仍未获取到 PayPal 重定向 URL',
-        '获取 PayPal 链接异常',
-        '无法获取 PayPal 审批链接',
         '该账号无激活权限',
         '金额校验失败'
     ];
@@ -263,7 +258,9 @@ function analyzeProcessOutput(output, timedOut) {
     // 注册阶段代理超时（Operation timed out 重复 / 浏览器连接被代理多次关闭）
     // → 当前代理质量差或被该 IP ban，立刻换代理 + 换账号重试
     if (normalized.includes('代理或网络持续超时')
-        || normalized.includes('浏览器连接被代理多次关闭')) {
+        || normalized.includes('浏览器连接被代理多次关闭')
+        || normalized.includes('apiRequestContext.get: Parse Error')
+        || normalized.includes('Parse Error: Expected HTTP/, RTSP/ or ICE/')) {
         return {
             status: 'retry',
             message: '当前代理超时严重，已切换代理重试',
@@ -365,10 +362,10 @@ function analyzeProcessOutput(output, timedOut) {
 
     if (normalized.includes('支付结果检测失败')) {
         return {
-            status: 'retry',
-            message: '支付检测失败，准备重试',
+            status: 'failed',
+            message: '支付结果检测失败，请人工核查后再决定是否重试',
             reachedPaypal: true,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -378,10 +375,10 @@ function analyzeProcessOutput(output, timedOut) {
         || normalized.includes('支付失败 (stripe_redirect_canceled)')
         || normalized.includes('支付失败 (paypal_blocked)')) {
         return {
-            status: 'retry',
-            message: 'PayPal/Stripe 端驳回支付，准备换号重试',
+            status: 'failed',
+            message: 'PayPal/Stripe 端驳回支付，本次任务终止',
             reachedPaypal: true,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -389,10 +386,10 @@ function analyzeProcessOutput(output, timedOut) {
 
     if (normalized.includes('PayPal 未渲染创建账户表单')) {
         return {
-            status: 'retry',
-            message: 'PayPal 仅渲染欢迎页，已多次刷新仍无表单，准备同号重试',
+            status: 'failed',
+            message: 'PayPal 仅渲染欢迎页，已多次刷新仍无表单，本次任务终止',
             reachedPaypal: false,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -432,7 +429,7 @@ function analyzeProcessOutput(output, timedOut) {
             status: 'failed',
             message: '激活失败 (超时或运行时错误)',
             reachedPaypal,
-            shouldRetry: true,
+            shouldRetry: false,
             deletePhone: false,
             deleteCard: false
         };
@@ -484,6 +481,7 @@ async function runActivationProcess(accessToken, cdk, runtimeAssets, runtimeJobK
 async function runActivationChild(scriptPath, args, env, onLine, options = {}) {
     return new Promise((resolve, reject) => {
         const runtimeJobKey = String(options.runtimeJobKey || '');
+        const stopController = options.stopController || null;
         const child = fork(scriptPath, args, {
             env,
             stdio: ['inherit', 'pipe', 'pipe', 'ipc']
@@ -505,6 +503,7 @@ async function runActivationChild(scriptPath, args, env, onLine, options = {}) {
         let idleTimer = null;
         let timedOut = false;
         let childExited = false;
+        let stopWatcherActive = true;
         const idleTimeoutMs = Math.max(0, Number(options.idleTimeoutMs) || 0);
         const timeoutErrorMessage = String(options.timeoutErrorMessage || '子进程执行超时');
 
@@ -539,6 +538,21 @@ async function runActivationChild(scriptPath, args, env, onLine, options = {}) {
             }
             reject(error);
         };
+
+        if (stopController) {
+            stopController.waitForStop().then(() => {
+                if (!stopWatcherActive || settled || childExited) {
+                    return;
+                }
+                const stopReason = stopController.reason || '管理员请求停止任务';
+                childError = stopReason;
+                combinedOutput += `\n[STOPPED] ${stopReason}\n`;
+                console.warn(`[Activation Child] ${childLabel} stop requested, killing child`);
+                try {
+                    child.kill('SIGKILL');
+                } catch (_) { }
+            }).catch(() => { });
+        }
 
         const resetIdleTimer = () => {
             if (!idleTimeoutMs || settled) {
@@ -638,6 +652,7 @@ async function runActivationChild(scriptPath, args, env, onLine, options = {}) {
 
         child.on('close', (code, signal) => {
             childExited = true;
+            stopWatcherActive = false;
             console.log(`[Activation Child] Closed ${childLabel} code=${code} signal=${signal || 'none'}`);
             runtimeLog.push({
                 jobKey: runtimeJobKey,
@@ -679,29 +694,20 @@ async function runActivationChild(scriptPath, args, env, onLine, options = {}) {
     });
 }
 
-async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
+async function runRegistrationProcess(onProgress, runtimeJobKey = '', stopController = null) {
     let lastProgress = 5;
     let lastMessage = '正在准备注册账号...';
 
     let poolSlot = null;
     const ownerKey = `reg:${String(runtimeJobKey || '').trim() || `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`}`;
 
-    let emailSource = 'random';
+    let emailSource = 'inbox';
     try {
-        emailSource = String(await store.getAppConfigValue('email_source', '')).toLowerCase();
-        if (!['random', 'pool', 'inbox'].includes(emailSource)) {
-            const legacy = String(await store.getAppConfigValue('pool_email_enabled', '0')) === '1';
-            emailSource = legacy ? 'pool' : 'random';
+        const configuredEmailSource = String(await store.getAppConfigValue('email_source', 'inbox')).toLowerCase();
+        if (configuredEmailSource !== 'inbox') {
+            console.warn(`[Registration] 已忽略 email_source=${configuredEmailSource}，当前版本统一使用 CF Worker 收件`);
         }
     } catch (_) { /* 用默认 */ }
-
-    try {
-        if (emailSource === 'pool') {
-            poolSlot = await store.reservePoolEmail(ownerKey);
-        }
-    } catch (err) {
-        console.warn(`[Registration] 邮箱池预留失败，回退随机邮箱: ${err.message}`);
-    }
 
     const childEnv = { ...process.env };
 
@@ -753,6 +759,7 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
     }
 
     try {
+        throwIfStopped(stopController);
         const result = await runActivationChild(path.join(__dirname, 'register_openai.js'), [], childEnv, (line) => {
             // 捕获子进程打印的"被服务端拒绝，跳过"日志，把无效域名加入进程级黑名单
             // 这样下次 fork 直接不传它，避免每次 fork 重复试错
@@ -773,7 +780,8 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
         }, {
             idleTimeoutMs: CONFIG.CHILD_IDLE_TIMEOUT_MS,
             timeoutErrorMessage: '注册阶段超过 60 秒无打印，已终止并准备重试',
-            runtimeJobKey: String(runtimeJobKey || '')
+            runtimeJobKey: String(runtimeJobKey || ''),
+            stopController
         });
 
         if (!result.result || !result.result.email || !result.result.accessToken) {
@@ -790,7 +798,7 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '') {
     }
 }
 
-async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBundle = {}) {
+async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBundle = {}, stopController = null) {
     let lastError = '';
 
     let randomDomainCfg = 'chiyiyi.cloud';
@@ -800,9 +808,7 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
     } catch (_) { /* 忽略，使用默认 */ }
     const protocolEnv = { ...process.env, RANDOM_EMAIL_DOMAIN: randomDomainCfg };
     // 把注册阶段的邮箱后端凭证透传给 oauth_login，让它用同一个 API 拿 OAuth 验证码
-    if (inboxBundle.emailSource) {
-        protocolEnv.EMAIL_SOURCE = inboxBundle.emailSource;
-    }
+    protocolEnv.EMAIL_SOURCE = 'inbox';
     if (inboxBundle.inboxJwt) {
         protocolEnv.INBOX_JWT = inboxBundle.inboxJwt;
     }
@@ -811,6 +817,7 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
     }
 
     for (let attempt = 1; attempt <= CONFIG.MAX_PROTOCOL_RETRIES; attempt += 1) {
+        throwIfStopped(stopController);
         let lastProgress = 85;
         let lastMessage = attempt === 1
             ? 'Plus 开通成功，准备提取协议...'
@@ -831,7 +838,8 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
         }, {
             idleTimeoutMs: CONFIG.CHILD_IDLE_TIMEOUT_MS,
             timeoutErrorMessage: '协议提取阶段超过 60 秒无打印，已终止并准备重试',
-            runtimeJobKey: String(runtimeJobKey || '')
+            runtimeJobKey: String(runtimeJobKey || ''),
+            stopController
         });
 
         if (result.result && result.result.fileName && result.result.filePath) {
@@ -848,7 +856,10 @@ async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBu
                 progress: 85,
                 message: `协议提取失败，正在重试 (${attempt}/${CONFIG.MAX_PROTOCOL_RETRIES})...`
             });
-            await sleep(CONFIG.RETRY_DELAY_MS);
+            const keepWaiting = await sleepWithStop(CONFIG.RETRY_DELAY_MS, { stopController });
+            if (!keepWaiting) {
+                throwIfStopped(stopController);
+            }
         }
     }
 
@@ -859,6 +870,10 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
     let accountAttempt = 0;
     let topupFailureCount = 0;
     const runtimeJobKey = String(options.jobKey || '');
+    const stopController = options.stopController || null;
+    const singleRun = options.singleRun === true;
+    const maxAccountRetries = singleRun ? 1 : CONFIG.MAX_ACCOUNT_RETRIES;
+    const maxActivationRetriesPerAccount = singleRun ? 1 : CONFIG.MAX_ACT_RETRIES_PER_ACCOUNT;
     const ownerKey = `prod:${cdk || 'admin'}:${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     runtimeLog.push({
@@ -868,7 +883,10 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
         text: `🎬 [成品流程] 开始  CDK = ${cdk || '(后台批量)'}`
     });
 
-    while (accountAttempt < CONFIG.MAX_ACCOUNT_RETRIES) {
+    await ensureActivationAssetsAvailable();
+
+    while (accountAttempt < maxAccountRetries) {
+        throwIfStopped(stopController);
         accountAttempt += 1;
         progressCallback({
             progress: 5,
@@ -879,7 +897,7 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
             console.log(`[Product] Attempt ${accountAttempt}: Registering...`);
             const regResult = await runRegistrationProcess((payload) => {
                 progressCallback(payload);
-            }, runtimeJobKey);
+            }, runtimeJobKey, stopController);
             const { email, accessToken } = regResult;
             // 注册阶段建立的邮箱后端凭证，要带给 oauth_login 用同一套 API 取 OAuth 验证码
             const inboxBundle = {
@@ -890,12 +908,14 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
 
             let activationAttempt = 0;
 
-            while (activationAttempt < CONFIG.MAX_ACT_RETRIES_PER_ACCOUNT) {
+            while (activationAttempt < maxActivationRetriesPerAccount) {
+                throwIfStopped(stopController);
                 activationAttempt += 1;
                 // 排队等待真正可用的资产（10s 一轮），最多等 5 分钟
                 let runtimeAssets = null;
                 const reserveDeadline = Date.now() + 5 * 60 * 1000;
                 while (Date.now() < reserveDeadline) {
+                    throwIfStopped(stopController);
                     runtimeAssets = await store.reserveRuntimeAssets(`${ownerKey}:${email}:${activationAttempt}`);
                     if (runtimeAssets.phone.phone && runtimeAssets.phone.phone !== '未配置' && runtimeAssets.card.number) {
                         break;
@@ -910,7 +930,10 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                         progress: 30,
                         message: '资产池暂时被占用，正在排队等待空闲手机号/银行卡...'
                     });
-                    await sleep(10000);
+                    const keepWaiting = await sleepWithStop(10000, { stopController });
+                    if (!keepWaiting) {
+                        throwIfStopped(stopController);
+                    }
                 }
 
                 if (!runtimeAssets) {
@@ -920,7 +943,7 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
 
                 const cardLast4 = runtimeAssets.card.number.slice(-4);
                 const cardExpiry = runtimeAssets.card.expiry || '';
-                console.log(`[Product] Account ${email} - Activation Attempt ${activationAttempt}/${CONFIG.MAX_ACT_RETRIES_PER_ACCOUNT}...`);
+                console.log(`[Product] Account ${email} - Activation Attempt ${activationAttempt}/${maxActivationRetriesPerAccount}...`);
                 console.log(
                     `[Product] Account ${email} - Using phone=${runtimeAssets.phone.phone} cardLast4=${cardLast4} expiry=${cardExpiry} proxy=${runtimeAssets.proxy ? 'yes' : 'no'}`
                 );
@@ -967,7 +990,7 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                             });
                         }
                     },
-                    { runtimeJobKey }
+                    { runtimeJobKey, stopController }
                 );
                 analysis = activationResult.analysis;
                 } finally {
@@ -1007,7 +1030,7 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                                 cardLast4,
                                 cardExpiry
                             });
-                        }, runtimeJobKey, inboxBundle);
+                        }, runtimeJobKey, inboxBundle, stopController);
                     } catch (e) {
                         const msg = e.message || String(e);
                         console.error(
@@ -1026,16 +1049,15 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
 
                     progressCallback({
                         progress: 99,
-                        message: '协议提取成功，正在绑定邮箱 Key...',
+                        message: '协议提取成功，正在整理交付信息...',
                         phone: runtimeAssets.phone.phone,
                         cardLast4,
                         cardExpiry
                     });
 
-                    const imapKey = await generateImapKey(email);
-                    // 协议成功 → 升级 status='正常'，补 file_path 和 imap_key
+                    // 协议成功 → 升级 status='正常'，补 file_path；旧 IMAP Key 已停用
                     const finalFilePath = oauthResult.sub2apiPath || oauthResult.sub2apiFile || oauthResult.filePath || '';
-                    await store.markProductReadyByEmail(email, finalFilePath, imapKey);
+                    await store.markProductReadyByEmail(email, finalFilePath, null);
 
                     await store.incrementAssetSuccessCount({
                         phone: runtimeAssets.phone.phone,
@@ -1047,7 +1069,6 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                         message: '成品号创建完成！',
                         result: {
                             email,
-                            imapKey,
                             sub2apiFile: oauthResult.sub2apiFile || oauthResult.fileName,
                             sub2apiPath: oauthResult.sub2apiPath || oauthResult.filePath,
                             cpaFile: oauthResult.cpaFile || '',
@@ -1061,7 +1082,6 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                     return {
                         success: true,
                         email,
-                        imapKey,
                         sub2apiFile: oauthResult.sub2apiFile || oauthResult.fileName,
                         sub2apiPath: oauthResult.sub2apiPath || oauthResult.filePath,
                         cpaFile: oauthResult.cpaFile || '',
@@ -1086,6 +1106,9 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                 }
 
                 if (analysis.message.includes('无激活权限')) {
+                    if (singleRun) {
+                        throw new Error(analysis.message || '该账号无激活权限,请更换账号重试');
+                    }
                     console.warn(`[Product] Account ${email}: No activation permission. Switching to new account...`);
                     progressCallback({
                         progress: Math.min(20 + accountAttempt * 5, 55),
@@ -1095,6 +1118,9 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                 }
 
                 if (analysis.shouldRetry || analysis.status === 'retry') {
+                    if (singleRun) {
+                        throw new Error(analysis.message || 'Plus 开通任务异常退出');
+                    }
                     if (analysis.deletePhone) {
                         const phoneToBan = runtimeAssets.phone.phone;
                         await store.deletePhoneAsset(phoneToBan);
@@ -1124,7 +1150,10 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                         cardLast4,
                         cardExpiry
                     });
-                    await sleep(CONFIG.RETRY_DELAY_MS);
+                    const keepWaiting = await sleepWithStop(CONFIG.RETRY_DELAY_MS, { stopController });
+                    if (!keepWaiting) {
+                        throwIfStopped(stopController);
+                    }
                     continue;
                 }
 
@@ -1132,10 +1161,15 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
             }
         } catch (error) {
             console.error(`[Product] Error in attempt ${accountAttempt}:`, error.message);
+            if (stopController?.stopped) {
+                throw new Error(stopController.reason || error.message || '管理员请求停止任务');
+            }
 
             const isFatal = error.message.includes('系统维护中')
                 || error.message.includes('系统原因导致上号失败次数过多')
                 || error.message.includes('余额不足')
+                || error.message.includes('资产池枯竭')
+                || error.message.includes('系统未配置可用')
                 || error.message.includes('无法获取有效的 Access Token')
                 || error.message.includes('页面仍无法正常显示');
 
@@ -1163,11 +1197,18 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
                 });
             }
 
-            if (accountAttempt >= CONFIG.MAX_ACCOUNT_RETRIES) {
+            if (singleRun) {
+                throw error;
+            }
+
+            if (accountAttempt >= maxAccountRetries) {
                 break;
             }
 
-            await sleep(CONFIG.RETRY_DELAY_MS);
+            const keepWaiting = await sleepWithStop(CONFIG.RETRY_DELAY_MS, { stopController });
+            if (!keepWaiting) {
+                throwIfStopped(stopController);
+            }
         }
     }
 

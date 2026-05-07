@@ -1,8 +1,8 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const ChatGPTService = require('./chatgpt');
-const fs = require('fs');
-const path = require('path');
+const { buildDebugScreenshotPath } = require('./debug-artifacts');
+const { probeCheckoutProxy } = require('./checkout-proxy-probe');
 const {
     needsPlaywrightProxyBridge,
     startLocalPlaywrightProxyBridge,
@@ -81,12 +81,6 @@ function buildPlaywrightProxy(proxyValue) {
     }
 }
 
-function buildDebugScreenshotPath(prefix) {
-    const screenshotDir = path.join(__dirname, 'debug_screenshots', '激活');
-    fs.mkdirSync(screenshotDir, { recursive: true });
-    return path.join(screenshotDir, `${prefix}_${Date.now()}.png`);
-}
-
 function getAvailableDebugPage(context, preferredPage) {
     if (preferredPage && !preferredPage.isClosed()) {
         return preferredPage;
@@ -105,7 +99,7 @@ async function captureDebugScreenshot(context, preferredPage, prefix, label = '�
         return null;
     }
 
-    const screenshotPath = buildDebugScreenshotPath(prefix);
+    const screenshotPath = buildDebugScreenshotPath('激活', prefix);
     await targetPage.screenshot({ path: screenshotPath, fullPage: true });
     console.log(`📸 [系统] ${label}已保存: ${screenshotPath}`);
     // (静默) 截图页面 URL 不再打印（信息冗长）
@@ -511,22 +505,21 @@ async function run() {
     try {
         // --- Phase 0: Proxy Connectivity Check ---
         if (proxyConfig) {
-            // (静默) 检查代理连通性
             try {
-                const probeResponse = await context.request.get("http://api.ipify.org/?format=text", {
-                    timeout: 15000
+                const probeResult = await probeCheckoutProxy(context.request, {
+                    onAttemptFailure: async ({ attempt, maxAttempts, error, nextDelayMs }) => {
+                        console.warn(
+                            `⚠️ [代理检查] 第 ${attempt}/${maxAttempts} 次探测失败: ${String(error?.message || error)}`
+                            + (attempt < maxAttempts ? `，${Math.max(1, Math.round(nextDelayMs / 1000))}s 后重试...` : '')
+                        );
+                    }
                 });
-                if (probeResponse.ok()) {
-                    const ip = (await probeResponse.text()).trim();
-                    // 保留进度标记关键字 "代理连接成功! 代理公网 IP" 以便 product_activator/server 识别进度，
-                    // 但只露最后两段，避免完整出口 IP 泄露
-                    const ipMasked = String(ip).replace(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/, '***.***.$3.$4');
-                    console.log(`✅ [系统] 代理连接成功! 代理公网 IP: ${ipMasked}`);
-                } else {
-                    throw new Error(`代理响应异常: HTTP ${probeResponse.status()}`);
-                }
+                const ipMasked = String(probeResult.ip).replace(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/, '***.***.$3.$4');
+                console.log(`✅ [系统] 代理连接成功! 代理公网 IP: ${ipMasked}`);
             } catch (proxyError) {
-                console.log("    [!] 请检查 PROXY 配置是否正确，或者账号余额是否充足。");
+                if (/代理认证失败|账号余额/.test(String(proxyError?.message || ''))) {
+                    console.log("    [!] 请检查 PROXY 配置是否正确，或者账号余额是否充足。");
+                }
                 throw proxyError;
             }
         }
@@ -650,6 +643,17 @@ async function run() {
                 "iframe[src*='turnstile']",
                 "iframe[src*='recaptcha']"
             ];
+            const HCAPTCHA_CHECKBOX_SELECTORS = [
+                "#checkbox",
+                "#checkbox-label",
+                "[id='checkbox']",
+                "[for='checkbox']",
+                "[role='checkbox']",
+                "[aria-checked]",
+                ".check",
+                ".checkbox",
+                "[class*='checkbox']"
+            ];
             const SLIDER_SELECTORS = [
                 "#captcha__frame__bottom .slider",
                 "#captcha__frame__bottom .sliderIcon",
@@ -711,6 +715,26 @@ async function run() {
                         return true;
                     } catch (e) {
                         console.warn(`⚠️ [风控] 验证按钮点击失败: ${e.message}`);
+                    }
+                }
+
+                const checkboxHit = await tryFindFirstVisible(HCAPTCHA_CHECKBOX_SELECTORS);
+                if (checkboxHit) {
+                    console.log(`🧩 [风控] 检测到 hCaptcha 复选框: ${checkboxHit.selector}`);
+                    try {
+                        const box = await checkboxHit.locator.boundingBox();
+                        if (box) {
+                            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 12 });
+                            await page.waitForTimeout(180);
+                            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                        } else {
+                            await checkboxHit.locator.click({ timeout: 2000 }).catch(() => { });
+                        }
+                        await page.waitForTimeout(3000);
+                        console.log("✅ [风控] hCaptcha 复选框点击完成。");
+                        return true;
+                    } catch (e) {
+                        console.warn(`⚠️ [风控] hCaptcha 复选框点击失败: ${e.message}`);
                     }
                 }
 
@@ -776,6 +800,20 @@ async function run() {
             }
             return false;
         };
+
+        async function waitForCreateAccountButton(timeoutMs = 25000) {
+            const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 25000);
+            while (Date.now() < deadline) {
+                await solveSlider();
+                await checkCriticalErrors();
+                const createBtn = page.getByRole('button', { name: 'Create an Account' });
+                if (await createBtn.isVisible().catch(() => false)) {
+                    return true;
+                }
+                await page.waitForTimeout(1200);
+            }
+            return false;
+        }
 
         /**
          * Continuous monitoring for security challenges
@@ -1174,6 +1212,51 @@ async function run() {
             }
         };
 
+        const pickFirstVisibleStripeInput = async (selectors, perTryMs = 5000) => {
+            for (const sel of selectors) {
+                const candidates = page.locator(sel);
+                const count = await candidates.count().catch(() => 0);
+                for (let index = 0; index < count; index += 1) {
+                    const candidate = candidates.nth(index);
+                    const looksVisible = await candidate.evaluate((node) => {
+                        try {
+                            if (!node) return false;
+                            const style = window.getComputedStyle(node);
+                            const rect = node.getBoundingClientRect?.();
+                            const ariaHidden = node.getAttribute('aria-hidden') === 'true';
+                            const className = String(node.className || '');
+                            return !ariaHidden
+                                && !className.includes('HiddenInput')
+                                && style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && style.pointerEvents !== 'none'
+                                && rect
+                                && rect.width > 0
+                                && rect.height > 0;
+                        } catch (_) {
+                            return false;
+                        }
+                    }).catch(() => false);
+                    if (!looksVisible) continue;
+                    if (await candidate.isVisible({ timeout: perTryMs }).catch(() => false)) {
+                        return candidate;
+                    }
+                }
+            }
+            return null;
+        };
+
+        const isSelectStripeField = async (loc) => {
+            if (!loc) return false;
+            return loc.evaluate((node) => {
+                try {
+                    return String(node?.tagName || '').toUpperCase() === 'SELECT';
+                } catch (_) {
+                    return false;
+                }
+            }).catch(() => false);
+        };
+
         // Phase 3C: 填写表单
         async function afterFieldTransition(page, fieldName) {
             if (Math.random() < 0.5) {
@@ -1199,7 +1282,7 @@ async function run() {
                 reloadGotoUrl: paypalUrl,
             });
 
-            await humanFillInput(page, page.locator('#billingAddressLine1'), CONFIG.billing.address);
+            await humanFillInput(page, page.locator('#billingAddressLine1'), CONFIG.billing.address, false, true);
 
             // 等待一下，看 Stripe 地址自动补全下拉是否出现
             await page.waitForTimeout(randomDelay(800, 1500));
@@ -1234,18 +1317,29 @@ async function run() {
             }
             await page.waitForTimeout(2000);
             if (!dropdownFound) {
-                // 没有下拉框：点一下页面顶部安全的空白区域，让地址框失焦
-                // (静默) 地址补全下拉未出现
-                // 点击页面顶部区域（远离表单，不会误触其他输入框）
-                const safeX = randomDelay(800, 1100);
-                const safeY = randomDelay(30, 80);
-                await page.mouse.move(safeX, safeY, { steps: 20 });
-                page.lastMouseX = safeX; page.lastMouseY = safeY;
-                await page.waitForTimeout(randomDelay(100, 300));
-                await page.mouse.down();
-                await page.waitForTimeout(randomDelay(50, 100));
-                await page.mouse.up();
-                await page.waitForTimeout(randomDelay(300, 600));
+                const manualModeLink = await pickFirstVisibleStripeInput([
+                    'text=Enter address manually',
+                    'a:has-text("Enter address manually")',
+                    'button:has-text("Enter address manually")',
+                    '[role="button"]:has-text("Enter address manually")'
+                ], 2000);
+
+                if (manualModeLink) {
+                    console.log("✅ [地址] 地址补全未出现，已展开手动地址模式。");
+                    await manualModeLink.click({ force: true });
+                    await page.waitForTimeout(randomDelay(700, 1200));
+                } else {
+                    // 没有下拉框也没有手动展开入口时，点一下页面顶部安全空白处让地址框失焦
+                    const safeX = randomDelay(800, 1100);
+                    const safeY = randomDelay(30, 80);
+                    await page.mouse.move(safeX, safeY, { steps: 20 });
+                    page.lastMouseX = safeX; page.lastMouseY = safeY;
+                    await page.waitForTimeout(randomDelay(100, 300));
+                    await page.mouse.down();
+                    await page.waitForTimeout(randomDelay(50, 100));
+                    await page.mouse.up();
+                    await page.waitForTimeout(randomDelay(300, 600));
+                }
             }
 
             console.log("✅ [步骤] 街道地址填写完成。");
@@ -1257,7 +1351,7 @@ async function run() {
             try {
                 await nameInput.waitFor({ state: 'attached', timeout: 1000 });
                 if (await nameInput.isVisible()) {
-                    await humanFillInput(page, nameInput, CONFIG.billing.name);
+                    await humanFillInput(page, nameInput, CONFIG.billing.name, false, true);
                     console.log("✅ [步骤] 姓名填写完成。");
                     await afterFieldTransition(page, 'name');
                 }
@@ -1272,31 +1366,66 @@ async function run() {
 
             // 这两个字段在 Stripe 部分账户类型下不存在；做一次 isVisible 预检（最多等 6s）
             // 避免直接进入 humanFillInput 触发 50s 超时浪费时间
-            const zipLoc = page.locator('#billingPostalCode').first();
-            const cityLoc = page.locator('#billingLocality').first();
-            const zipVisible = await zipLoc.isVisible({ timeout: 6000 }).catch(() => false);
-            const cityVisible = await cityLoc.isVisible({ timeout: 1000 }).catch(() => false);
+            const zipLoc = await pickFirstVisibleStripeInput([
+                '#billingPostalCode',
+                '#billingAddressPostalCode',
+                '#billingZip',
+                'input[name="postalCode"]',
+                'input[name="zip"]',
+                'input[name="billingPostalCode"]'
+            ], 6000);
+            const cityLoc = await pickFirstVisibleStripeInput([
+                '#billingAddressCity',
+                '#billingLocality',
+                '#billingCity',
+                'input[name="city"]',
+                'input[name="billingAddressCity"]'
+            ], 3000);
+            const stateLoc = await pickFirstVisibleStripeInput([
+                '#billingAddressState',
+                '#billingState',
+                'select[name="state"]',
+                'select[name="billingState"]'
+            ], 3000);
 
-            if (!zipVisible && !cityVisible) {
-                console.log("⏩ [步骤] 当前 Stripe 表单无 #billingPostalCode / #billingLocality 字段，跳过。");
+            if (!zipLoc && !cityLoc && !stateLoc) {
+                console.log("⏩ [步骤] 当前 Stripe 表单无可见邮编/城市/州字段，跳过。");
                 return;
             }
 
             if (Math.random() > 0.5) {
-                if (zipVisible) {
-                    await humanFillInput(page, zipLoc, CONFIG.billing.zip);
+                if (zipLoc) {
+                    await humanFillInput(page, zipLoc, CONFIG.billing.zip, false, true);
                     await afterFieldTransition(page, 'zip');
                 }
-                if (cityVisible) {
-                    await humanFillInput(page, cityLoc, CONFIG.billing.city);
+                if (cityLoc) {
+                    await humanFillInput(page, cityLoc, CONFIG.billing.city, false, true);
+                }
+                if (stateLoc) {
+                    if (await isSelectStripeField(stateLoc)) {
+                        await stateLoc.selectOption({ value: CONFIG.billing.state }).catch(async () => {
+                            await stateLoc.selectOption({ label: CONFIG.billing.state }).catch(() => { });
+                        });
+                    } else {
+                        await humanFillInput(page, stateLoc, CONFIG.billing.state, false, true);
+                    }
                 }
             } else {
-                if (cityVisible) {
-                    await humanFillInput(page, cityLoc, CONFIG.billing.city);
+                if (cityLoc) {
+                    await humanFillInput(page, cityLoc, CONFIG.billing.city, false, true);
                     await afterFieldTransition(page, 'city');
                 }
-                if (zipVisible) {
-                    await humanFillInput(page, zipLoc, CONFIG.billing.zip);
+                if (stateLoc) {
+                    if (await isSelectStripeField(stateLoc)) {
+                        await stateLoc.selectOption({ value: CONFIG.billing.state }).catch(async () => {
+                            await stateLoc.selectOption({ label: CONFIG.billing.state }).catch(() => { });
+                        });
+                    } else {
+                        await humanFillInput(page, stateLoc, CONFIG.billing.state, false, true);
+                    }
+                }
+                if (zipLoc) {
+                    await humanFillInput(page, zipLoc, CONFIG.billing.zip, false, true);
                 }
             }
             console.log("✅ [步骤] 邮编与城市填写完成。");
@@ -1416,20 +1545,20 @@ async function run() {
             const validateStripeCompleteness = async (page) => {
                 // (静默) 校验 Stripe 表单完整性（仅在补填或全部缺失时打印）
                 const criticalSelectors = [
-                    { sel: '#billingName', name: "姓名", val: CONFIG.billing.name },
-                    { sel: '#billingAddressLine1', name: "街道地址", val: CONFIG.billing.address },
-                    { sel: '#billingAddressCity', name: "城市", val: CONFIG.billing.city },
-                    { sel: '#billingAddressState', name: "州/省", val: CONFIG.billing.state },
-                    { sel: '#billingPostalCode', name: "邮编", val: CONFIG.billing.zip }
+                    { selectors: ['#billingName'], name: "姓名", val: CONFIG.billing.name },
+                    { selectors: ['#billingAddressLine1'], name: "街道地址", val: CONFIG.billing.address },
+                    { selectors: ['#billingAddressCity', '#billingLocality', '#billingCity'], name: "城市", val: CONFIG.billing.city },
+                    { selectors: ['#billingAddressState', '#billingState'], name: "州/省", val: CONFIG.billing.state },
+                    { selectors: ['#billingPostalCode', '#billingAddressPostalCode', '#billingZip'], name: "邮编", val: CONFIG.billing.zip }
                 ];
                 let refilledCount = 0;
                 for (const item of criticalSelectors) {
-                    const el = page.locator(item.sel);
-                    if (await el.isVisible().catch(() => false)) {
+                    const el = await pickFirstVisibleStripeInput(item.selectors, 2000);
+                    if (el) {
                         const val = await el.inputValue().catch(() => "");
                         if (!val || val.trim().length < 1) {
                             console.warn(`[!] [效验失败] Stripe ${item.name} 为空，紧急补填...`);
-                            await humanFillInput(page, el, item.val);
+                            await humanFillInput(page, el, item.val, false, true);
                             await page.waitForTimeout(300);
                             refilledCount++;
                         }
@@ -1473,13 +1602,7 @@ async function run() {
         console.log("⏳ [步骤] 正在等待 PayPal 创建账户按钮出现...");
         // PayPal 偶发只渲染静态欢迎页（"PayPal is the safer, easier way to pay" + 购物袋盾牌图），
         // 此时按钮永远不出现。多刷新几次给 PayPal 重新拉账户表单的机会。
-        const tryWaitCreateBtn = async (timeoutMs = 25000) => {
-            try {
-                await page.getByRole('button', { name: 'Create an Account' }).waitFor({ state: 'visible', timeout: timeoutMs });
-                return true;
-            } catch (_) { return false; }
-        };
-        let createBtnReady = await tryWaitCreateBtn(25000);
+        let createBtnReady = await waitForCreateAccountButton(25000);
         let refreshAttempts = 0;
         while (!createBtnReady && refreshAttempts < 2) {
             refreshAttempts += 1;
@@ -1490,8 +1613,7 @@ async function run() {
             } catch (e) {
                 console.warn(`⚠️ [步骤] 刷新失败: ${e.message}`);
             }
-            await solveSlider().catch(() => { });
-            createBtnReady = await tryWaitCreateBtn(25000);
+            createBtnReady = await waitForCreateAccountButton(25000);
         }
         if (!createBtnReady) {
             const currentUrl = page.url();

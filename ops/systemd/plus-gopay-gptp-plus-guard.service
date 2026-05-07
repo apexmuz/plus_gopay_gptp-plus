@@ -1,0 +1,12 @@
+[Unit]
+Description=Guard plus_gopay_gptp_plus stack and register.lovelymira.com ingress
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/plus-gopay-gptp-plus-guard.sh
+
+[Install]
+WantedBy=multi-user.target

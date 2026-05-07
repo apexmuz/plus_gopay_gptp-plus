@@ -1,12 +1,6 @@
 const fs = require('fs');
-const path = require('path');
 const { runRegistrationFlow } = require('./register_openai');
-
-function ensureDir(dirPath) {
-    if (!fs.existsSync(dirPath)) {
-        fs.mkdirSync(dirPath, { recursive: true });
-    }
-}
+const { ensureDebugArtifactDir, buildDebugArtifactPath } = require('./debug-artifacts');
 
 async function main() {
     const startedAt = new Date();
@@ -14,13 +8,9 @@ async function main() {
 
     const result = await runRegistrationFlow();
 
-    const debugDir = path.join(__dirname, 'debug_screenshots', '注册');
-    ensureDir(debugDir);
+    ensureDebugArtifactDir('注册');
 
-    const resultPath = path.join(
-        debugDir,
-        `register_debug_result_${Date.now()}.json`
-    );
+    const resultPath = buildDebugArtifactPath('注册', 'register_debug_result', '.json');
 
     fs.writeFileSync(resultPath, JSON.stringify({
         exported_at: new Date().toISOString(),

@@ -1,3 +1,5 @@
+const { normalizeExcludedCodes, isCodeExcluded } = require('./otp-code-utils');
+
 const DEFAULT_API_BASE = 'https://temp-email-api.jzqkwl.com';
 const DEFAULT_POLL_INTERVAL_SECONDS = 3;
 const MAILBOX_QUERY_LIMIT = 30;
@@ -100,18 +102,70 @@ function _mailHeaders(mailboxToken) {
     };
 }
 
+// 把 quoted-printable 编码 (=XX / =\r\n) 还原成普通文本，并去掉 HTML 标签。
+// 验证码邮件原 raw 里 header 包含 X-Mailgun-Sending-Ip-Pool / Message-Id 等带连续数字的串，
+// 必须先剥到"渲染后正文"再做 OTP 匹配，否则 6 位数字 fallback 会误抓 mailgun pool id。
+function _stripEmailToVisibleText(input) {
+    let text = String(input || '');
+    if (!text) return '';
+
+    // 1) 切到 body：第一个空行之后才是 body；找不到就保持原文（小心别在 header 里乱抓）
+    const bodyStart = text.indexOf('\r\n\r\n');
+    const body = bodyStart >= 0 ? text.slice(bodyStart + 4) : text;
+
+    // 2) quoted-printable 解码：=XX 还原成对应字符；=\r\n / =\n 是软换行直接删
+    const joined = body.replace(/=\r?\n/g, '');
+    const bytes = [];
+    for (let i = 0; i < joined.length; i += 1) {
+        const ch = joined[i];
+        if (ch === '=' && /[0-9A-Fa-f]{2}/.test(joined.slice(i + 1, i + 3))) {
+            try {
+                bytes.push(parseInt(joined.slice(i + 1, i + 3), 16));
+            } catch (_) {
+                // ignore malformed quoted-printable bytes
+            }
+            i += 2;
+            continue;
+        }
+        bytes.push(joined.charCodeAt(i));
+    }
+    let decoded = Buffer.from(bytes).toString('utf8');
+
+    // 3) 去 HTML 标签 + 折叠空白
+    decoded = decoded
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&#(\d+);/g, (_, n) => {
+            try { return String.fromCharCode(Number(n)); } catch (_) { return ''; }
+        })
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return decoded;
+}
+
 function _extractOtpCode(content) {
     const text = String(content || '');
     if (!text) return '';
+    // 显式带"verification code/code is/use code"等上下文的 OTP 匹配
+    // 不再使用全文 6 位数字 fallback：邮件 header / mailgun id / message-id 里都有 6 位连续数字段，
+    // 兜底只会抓错。OpenAI 邮件正文里 OTP 一定在以下文案附近出现。
     const patterns = [
-        /OpenAI verification code[^0-9]{0,20}(\d{6})/i,
-        /verification code[^0-9]{0,20}(\d{6})/i,
-        /verify your email[^0-9]{0,20}(\d{6})/i,
-        /Use code[^0-9]{0,20}(\d{6})/i,
-        /Your ChatGPT code is\s*(\d{6})/i,
-        /ChatGPT code is\s*(\d{6})/i,
-        /temporary verification code to continue:\s*(\d{6})/i,
-        /(?<!\d)(\d{6})(?!\d)/
+        /temporary verification code to continue:?\s*(\d{6})\b/i,
+        /OpenAI verification code[^0-9]{0,30}(\d{6})\b/i,
+        /verification code[^0-9]{0,30}(\d{6})\b/i,
+        /verify your email[^0-9]{0,30}(\d{6})\b/i,
+        /Use code[^0-9]{0,10}(\d{6})\b/i,
+        /Your ChatGPT code is\s*(\d{6})\b/i,
+        /ChatGPT code is\s*(\d{6})\b/i,
+        // 中文邮件兜底（部分账号会触发本地化模板）
+        /验证码[^0-9]{0,10}(\d{6})\b/,
+        // 日文模板：この一時検証コードを入力して続行してください: 123456
+        /一時(?:検証|認証)コード[^0-9]{0,20}(\d{6})\b/,
+        /Code[:\s]+(\d{6})\b/i
     ];
     for (const pattern of patterns) {
         const match = text.match(pattern);
@@ -153,11 +207,38 @@ function _collectMessageTextParts(value, parts = [], depth = 0) {
 
 function _extractOtpCodeFromMessage(message) {
     const payload = { ...(message || {}) };
+
+    // 1) 显式字段最优先（CF Worker 后端如果直接给出结构化字段就用它）
     for (const key of ['verification_code', 'verificationCode', 'otp', 'otp_code', 'otpCode', 'code']) {
         const candidate = String(payload[key] || '').trim();
         if (/^\d{6}$/.test(candidate)) return candidate;
     }
-    return _extractOtpCode(_collectMessageTextParts(payload).join('\n'));
+
+    // 2) 优先在"可见正文"里搜：raw 邮件 → 切 body → 解 QP → 剥 HTML → 折空白
+    const rawText = String(payload.raw || payload.body || payload.body_html || payload.html || '');
+    if (rawText) {
+        const visible = _stripEmailToVisibleText(rawText);
+        const codeFromVisible = _extractOtpCode(visible);
+        if (codeFromVisible) return codeFromVisible;
+    }
+
+    // 3) 如果后端只给 plain/text/snippet 等纯文本字段，直接尝试匹配
+    for (const key of ['text', 'plain', 'plain_text', 'plainText', 'body_text', 'bodyText', 'snippet', 'preview']) {
+        const candidate = String(payload[key] || '').trim();
+        if (candidate) {
+            const c = _extractOtpCode(candidate);
+            if (c) return c;
+        }
+    }
+
+    // 4) 最后只在 subject 里再找一次（subject 也可能带 "Code: 123456" 类型）
+    const subject = String(payload.subject || '');
+    if (subject) {
+        const c = _extractOtpCode(subject);
+        if (c) return c;
+    }
+
+    return '';
 }
 
 async function createAddress({ baseUrl, adminPassword = '', name = '', domain = '', enablePrefix = true, preferredDomain = '' } = {}) {
@@ -234,7 +315,7 @@ async function _fetchMailPage(apiBase, mailboxToken, folder = '') {
     return { ok: true, statusCode: status, messages: Array.isArray(data?.results) ? data.results : [] };
 }
 
-function _extractCodeFromMessages(messages, email, seenIds) {
+function _extractCodeFromMessages(messages, email, seenIds, excludedSet = null) {
     for (const message of messages || []) {
         if (!message || typeof message !== 'object') continue;
         let messageId = String(message.id || message.createdAt || '').trim();
@@ -248,7 +329,7 @@ function _extractCodeFromMessages(messages, email, seenIds) {
             continue;
         }
         const code = _extractOtpCodeFromMessage(message);
-        if (code) return code;
+        if (code && (!excludedSet || !isCodeExcluded(code, excludedSet))) return code;
     }
     return '';
 }
@@ -267,6 +348,7 @@ async function fetchLatestOpenAiOtp({
     const mailboxToken = String(jwt || '').trim();
     const seenIds = new Set();
     let lastResendAt = 0;
+    const excludedSet = normalizeExcludedCodes(excludeCode);
 
     console.log(`📨 [Inbox] 正在为 ${address || '(未知地址)'} 通过 ${apiBase} 获取验证码...`);
 
@@ -284,27 +366,36 @@ async function fetchLatestOpenAiOtp({
         try {
             let inboxPage = await _fetchMailPage(apiBase, mailboxToken, 'inbox');
             if (inboxPage.ok) {
-                let code = _extractCodeFromMessages(inboxPage.messages, address, seenIds);
-                if (code && code !== excludeCode) return code;
+                let code = _extractCodeFromMessages(inboxPage.messages, address, seenIds, excludedSet);
+                if (code) return code;
                 for (const folder of MAILBOX_FOLDER_CANDIDATES.slice(1)) {
                     const folderPage = await _fetchMailPage(apiBase, mailboxToken, folder);
                     if (folderPage.ok) {
-                        code = _extractCodeFromMessages(folderPage.messages, address, seenIds);
-                        if (code && code !== excludeCode) return code;
+                        code = _extractCodeFromMessages(folderPage.messages, address, seenIds, excludedSet);
+                        if (code) return code;
                     }
+                }
+
+                // 某些 CF Worker 部署虽然支持 folder 参数，但新邮件只会出现在默认聚合视图，
+                // `folder=inbox` / `junk` 查询会返回 200 + 空列表。此时必须再回退查一次无 folder 的总视图，
+                // 否则会把“邮件已到达但不在命名文件夹”误判成超时。
+                const fallbackPage = await _fetchMailPage(apiBase, mailboxToken, '');
+                if (fallbackPage.ok) {
+                    code = _extractCodeFromMessages(fallbackPage.messages, address, seenIds, excludedSet);
+                    if (code) return code;
                 }
             } else {
                 inboxPage = await _fetchMailPage(apiBase, mailboxToken, '');
                 if (inboxPage.ok) {
-                    const code = _extractCodeFromMessages(inboxPage.messages, address, seenIds);
-                    if (code && code !== excludeCode) return code;
+                    const code = _extractCodeFromMessages(inboxPage.messages, address, seenIds, excludedSet);
+                    if (code) return code;
                 }
             }
         } catch (err) {
             console.error(`⚠️  [Inbox] 本次轮询失败: ${err.message}`);
         }
 
-        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % Math.ceil(30 / DEFAULT_POLL_INTERVAL_SECONDS) === 0) {
+        if (excludedSet.size > 0 && onNoNewCodeFor30Seconds && (i + 1) % Math.ceil(30 / DEFAULT_POLL_INTERVAL_SECONDS) === 0) {
             const now = Date.now();
             if (now - lastResendAt >= 28000) {
                 lastResendAt = now;

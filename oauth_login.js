@@ -4,8 +4,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { getImapAuthHeaders } = require('./imap-auth');
 const inboxEmail = require('./inbox-email');
+const { buildDebugScreenshotPath } = require('./debug-artifacts');
 const {
     needsPlaywrightProxyBridge,
     startLocalPlaywrightProxyBridge,
@@ -134,26 +134,6 @@ async function buildAxiosTransportConfig(proxyValue) {
 /**
  * 获取验证码的工具函数
  */
-function normalizeImapTimestamp(message) {
-    const candidates = [
-        message?.createdAt,
-        message?.updatedAt,
-        message?.receivedAt,
-        message?.date,
-        message?.timestamp
-    ];
-
-    for (const candidate of candidates) {
-        if (!candidate) continue;
-        const value = new Date(candidate).getTime();
-        if (!Number.isNaN(value)) {
-            return value;
-        }
-    }
-
-    return Number(message?.id || 0);
-}
-
 function getRandomEmailDomain() {
     return String(process.env.RANDOM_EMAIL_DOMAIN || 'chiyiyi.cloud')
         .trim()
@@ -184,136 +164,20 @@ function normalizeCloudEmail(email) {
 
 async function getLatestCode(email, maxRetries = 30, excludeCode = '', options = {}) {
     const normalizedEmail = normalizeCloudEmail(email);
-
-    // 🆕 注册阶段如果用的是 Inbox 临时邮箱（temp-email-api），oauth_login 也必须用同一个 API 取码，
-    // 否则会跑去问 chiyiyi.cloud 拿邮件，永远拿不到。
-    const emailSource = String(process.env.EMAIL_SOURCE || '').toLowerCase();
     const inboxJwt = String(process.env.INBOX_JWT || '');
     const inboxApiBase = String(process.env.INBOX_API_BASE || '').trim().replace(/\/+$/, '');
-    if (emailSource === 'inbox' && inboxJwt && inboxApiBase) {
-        return inboxEmail.fetchLatestOpenAiOtp({
-            baseUrl: inboxApiBase,
-            jwt: inboxJwt,
-            address: normalizedEmail,
-            maxRetries,
-            excludeCode,
-            onNoNewCodeFor30Seconds: options.onNoNewCodeFor30Seconds || null,
-            onBeforePoll: options.onBeforePoll || null
-        });
+    if (!inboxJwt || !inboxApiBase) {
+        throw new Error('CF Worker 邮箱上下文缺失，无法拉取 OAuth 验证码');
     }
-
-    console.log(`📨 [IMAP] 正在为 ${normalizedEmail} 获取验证码...`);
-    const url = 'https://imap.chiyiyi.cloud/api/admin/all-messages?limit=15';
-    const onNoNewCodeFor30Seconds = typeof options.onNoNewCodeFor30Seconds === 'function'
-        ? options.onNoNewCodeFor30Seconds
-        : null;
-    const onBeforePoll = typeof options.onBeforePoll === 'function'
-        ? options.onBeforePoll
-        : null;
-    let lastResendAt = 0;
-
-    for (let i = 0; i < maxRetries; i++) {
-        // 每 5 轮打印一次进度，避免刷屏
-        if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
-            console.log(`📨 [IMAP] 轮询中 ${i + 1}/${maxRetries}...`);
-        }
-
-        if (onBeforePoll) {
-            const recovered = await onBeforePoll(i + 1);
-            if (recovered) {
-                console.log('📨 [IMAP] 页面已恢复，继续等待新验证码...');
-            }
-        }
-
-        try {
-            let headers = await getImapAuthHeaders(false);
-            const response = await axios.get(url, {
-                headers
-            });
-            const messages = response.data.messages;
-            if (Array.isArray(messages) && messages.length > 0) {
-                const targetMessages = messages
-                    .filter(m =>
-                        m?.targetEmail?.toLowerCase() === normalizedEmail &&
-                        (m?.service === 'ChatGPT' || String(m?.subject || '').toLowerCase().includes('verification'))
-                    )
-                    .sort((a, b) => normalizeImapTimestamp(b) - normalizeImapTimestamp(a));
-
-                const targetMsg = targetMessages.find(m => String(m.code || '').trim() && String(m.code).trim() !== excludeCode)
-                    || targetMessages.find(m => String(m.code || '').trim());
-
-                if (targetMsg) {
-                    const code = String(targetMsg.code).trim();
-                    if (excludeCode && code === excludeCode) {
-                        // (静默) 仍是旧验证码
-                    } else {
-                        console.log(`📨 [IMAP] 已获取验证码: ${code}`);
-                        return code;
-                    }
-                }
-                // (静默) 暂未读取到新验证码
-            }
-            // (静默) 邮件列表为空
-        } catch (err) {
-            if (err.response && err.response.status === 401) {
-                console.warn('📨 [IMAP] 鉴权失败 (401)，正在强制刷新 Token 后重试...');
-                try {
-                    const headers = await getImapAuthHeaders(true);
-                    const retryResponse = await axios.get(url, { headers });
-                    const messages = retryResponse.data.messages;
-                    if (Array.isArray(messages) && messages.length > 0) {
-                        const targetMessages = messages
-                            .filter(m =>
-                                m?.targetEmail?.toLowerCase() === normalizedEmail &&
-                                (m?.service === 'ChatGPT' || String(m?.subject || '').toLowerCase().includes('verification'))
-                            )
-                            .sort((a, b) => normalizeImapTimestamp(b) - normalizeImapTimestamp(a));
-
-                        const targetMsg = targetMessages.find(m => String(m.code || '').trim() && String(m.code).trim() !== excludeCode)
-                            || targetMessages.find(m => String(m.code || '').trim());
-
-                        if (targetMsg) {
-                            const code = String(targetMsg.code).trim();
-                            if (excludeCode && code === excludeCode) {
-                                console.log(`📨 [IMAP] 当前最新验证码仍是旧值 ${code}，继续等待新验证码...`);
-                            } else {
-                                console.log(`📨 [IMAP] 成功获取验证码: ${code}`);
-                                return code;
-                            }
-                        } else {
-                            console.log('📨 [IMAP] 刷新 Token 后暂未读取到该邮箱的新验证码，继续轮询...');
-                        }
-                    } else {
-                        console.log('📨 [IMAP] 刷新 Token 后邮件列表为空，继续轮询...');
-                    }
-                } catch (refreshErr) {
-                    console.warn(`📨 [IMAP] Token 刷新后轮询仍失败: ${refreshErr.message || refreshErr}`);
-                }
-            } else {
-                console.warn(`📨 [IMAP] 本次轮询失败: ${err.message || err}`);
-            }
-        }
-
-        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
-            const now = Date.now();
-            if (now - lastResendAt >= 28000) {
-                lastResendAt = now;
-                await onNoNewCodeFor30Seconds();
-            }
-        }
-
-        for (let waitTick = 0; waitTick < 10; waitTick += 1) {
-            if (onBeforePoll) {
-                const recovered = await onBeforePoll(i + 1);
-                if (recovered) {
-                    console.log('📨 [IMAP] 页面恢复完成，保持旧验证码排除，继续等待新验证码...');
-                    break;
-                }
-            }
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-    }
-    throw new Error('获取验证码超时');
+    return inboxEmail.fetchLatestOpenAiOtp({
+        baseUrl: inboxApiBase,
+        jwt: inboxJwt,
+        address: normalizedEmail,
+        maxRetries,
+        excludeCode,
+        onNoNewCodeFor30Seconds: options.onNoNewCodeFor30Seconds || null,
+        onBeforePoll: options.onBeforePoll || null
+    });
 }
 
 function formatUtc8Timestamp(timestampMs) {
@@ -459,9 +323,7 @@ async function saveFailureScreenshot(page, prefix = 'oauth_login_error') {
         return null;
     }
 
-    const screenshotDir = path.join(__dirname, 'debug_screenshots', '上号');
-    fs.mkdirSync(screenshotDir, { recursive: true });
-    const screenshotPath = path.join(screenshotDir, `${prefix}_${Date.now()}.png`);
+    const screenshotPath = buildDebugScreenshotPath('上号', prefix);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     console.log(`📸 [系统] 异常截图已保存: ${screenshotPath}`);
     return screenshotPath;

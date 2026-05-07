@@ -129,7 +129,7 @@ async function initializeBaseData() {
             'pool_email_imap_host', 'outlook.office365.com',
             'pool_email_include_junk', '1',
             'random_email_domain', 'chiyiyi.cloud',
-            'email_source', 'random',
+            'email_source', 'inbox',
             'inbox_api_base', 'https://temp-email-api.jzqkwl.com',
             'inbox_admin_password', '',
             'inbox_email_domain', '',
@@ -282,7 +282,8 @@ function isResumableProductGenerationTask(task) {
     }
 
     const message = String(task.lastError || '');
-    return message.includes('系统维护中')
+    return message.includes('管理员请求停止')
+        || message.includes('系统维护中')
         || message.includes('余额不足')
         || message.includes('代理')
         || message.includes('无法获取有效的 Access Token')
@@ -326,7 +327,7 @@ async function getAdminData() {
         runQuery(
             `SELECT config_key, config_value
              FROM app_config
-             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 'proxy',
                 'max_concurrent_activations',
@@ -403,7 +404,7 @@ async function getAdminData() {
             maintenance_mode_drain: String(configMap.maintenance_mode_drain || '0') === '1',
             email_source: ['random', 'pool', 'inbox'].includes(String(configMap.email_source || ''))
                 ? String(configMap.email_source)
-                : (String(configMap.pool_email_enabled || '0') === '1' ? 'pool' : 'random'),
+                : 'inbox',
             pool_email_enabled: String(configMap.pool_email_enabled || '0') === '1',
             pool_email_imap_host: String(configMap.pool_email_imap_host || 'outlook.office365.com').trim() || 'outlook.office365.com',
             pool_email_include_junk: String(configMap.pool_email_include_junk || '1') === '1',
@@ -447,7 +448,10 @@ async function getAdminData() {
             product_resume_message: resumableTask
                 ? `系统错误中断，剩余 ${resumableTask.remainingCount} 个待继续生产`
                 : '',
-            product_resume_job_key: resumableTask?.jobKey || ''
+            product_resume_job_key: resumableTask?.jobKey || '',
+            product_running_job_key: productPendingRows.length > 0
+                ? parseAdminProductGenerationTask(productPendingRows[0]).jobKey
+                : ''
         },
         logs: logRows.map((row) => {
             const isAdminProductGeneration = String(row.cdk_code || '').startsWith('ADMIN_PRODUCT_GEN:');
@@ -475,7 +479,7 @@ async function saveConfig(config) {
     const maintenanceModeDrain = config?.maintenance_mode_drain ? '1' : '0';
     const emailSource = ['random', 'pool', 'inbox'].includes(String(config?.email_source))
         ? String(config.email_source)
-        : (config?.pool_email_enabled ? 'pool' : 'random');
+        : 'inbox';
     // 兼容旧字段：email_source 是真相，pool_email_enabled 由它派生
     const poolEmailEnabled = emailSource === 'pool' ? '1' : '0';
     const poolEmailImapHost = String(config?.pool_email_imap_host || 'outlook.office365.com').trim() || 'outlook.office365.com';
@@ -1686,6 +1690,8 @@ module.exports = {
     ensureReady,
     getAdminData,
     getResumableAdminProductGeneration,
+    parseAdminProductGenerationTask,
+    isResumableProductGenerationTask,
     saveConfig,
     getAdminAuthConfig,
     updateAdminPassword,

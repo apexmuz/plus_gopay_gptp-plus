@@ -3,6 +3,7 @@ const assert = require('assert');
 const test = require('node:test');
 
 const inboxEmail = require('../inbox-email');
+const { withMutedConsole } = require('./helpers/mute-console');
 
 function startServer(handler) {
     return new Promise((resolve) => {
@@ -48,7 +49,7 @@ test('cf worker inbox creates mailbox and fetches otp', async () => {
             id: 12,
             address: 'abc@test.example',
             subject: 'OpenAI verification code',
-            raw: 'Subject: OpenAI verification code\r\n\r\nYour code is 123456'
+            raw: 'Subject: OpenAI verification code\r\n\r\nEnter this temporary verification code to continue: 123456'
         }
     ];
 
@@ -101,12 +102,12 @@ test('cf worker inbox creates mailbox and fetches otp', async () => {
     assert.strictEqual(created.mailboxToken, 'mailbox-jwt');
     assert.strictEqual(created.apiBase, baseUrl);
 
-    const otp = await inboxEmail.fetchLatestOpenAiOtp({
+    const otp = await withMutedConsole(['log'], async () => inboxEmail.fetchLatestOpenAiOtp({
         baseUrl,
         jwt: created.mailboxToken,
         address: created.email,
         maxRetries: 1
-    });
+    }));
     assert.strictEqual(otp, '123456');
 
     const deleted = await inboxEmail.deleteMailbox(created.email);

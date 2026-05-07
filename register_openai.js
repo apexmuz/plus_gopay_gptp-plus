@@ -3,9 +3,11 @@ const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { getImapAuthHeaders } = require('./imap-auth');
-const { fetchLatestOpenAiOtpOnce } = require('./pool-email-imap');
 const inboxEmail = require('./inbox-email');
+const { createRegistrationProfile } = require('./registration-identity');
+const { normalizeExcludedCodes, isCodeExcluded } = require('./otp-code-utils');
+const { detectRegistrationAdvance } = require('./registration-submit-state');
+const { buildDebugScreenshotPath } = require('./debug-artifacts');
 const {
     needsPlaywrightProxyBridge,
     startLocalPlaywrightProxyBridge,
@@ -59,29 +61,6 @@ async function checkProxyAvailability(proxyUrl) {
     }
 }
 
-/**
- * 获取验证码的工具函数 (已加入 Bearer Token)
- */
-function normalizeImapTimestamp(message) {
-    const candidates = [
-        message?.createdAt,
-        message?.updatedAt,
-        message?.receivedAt,
-        message?.date,
-        message?.timestamp
-    ];
-
-    for (const candidate of candidates) {
-        if (!candidate) continue;
-        const value = new Date(candidate).getTime();
-        if (!Number.isNaN(value)) {
-            return value;
-        }
-    }
-
-    return Number(message?.id || 0);
-}
-
 function getRandomEmailDomain() {
     return String(process.env.RANDOM_EMAIL_DOMAIN || 'chiyiyi.cloud')
         .trim()
@@ -112,206 +91,20 @@ function normalizeCloudEmail(email) {
 
 async function getLatestCode(email, maxRetries = 24, excludeCode = '', options = {}) {
     const normalizedEmail = normalizeCloudEmail(email);
-    console.log(`📨 [IMAP] 正在为 ${normalizedEmail} 获取验证码...`);
-    const url = 'https://imap.chiyiyi.cloud/api/admin/all-messages?limit=15';
-    const onNoNewCodeFor30Seconds = typeof options.onNoNewCodeFor30Seconds === 'function'
-        ? options.onNoNewCodeFor30Seconds
-        : null;
-    const onBeforePoll = typeof options.onBeforePoll === 'function'
-        ? options.onBeforePoll
-        : null;
-    let lastResendAt = 0;
-
-    for (let i = 0; i < maxRetries; i++) {
-        // 每 5 轮打印一次进度，避免刷屏
-        if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
-            console.log(`📨 [IMAP] 轮询中 ${i + 1}/${maxRetries}...`);
-        }
-
-        if (onBeforePoll) {
-            const recovered = await onBeforePoll(i + 1);
-            if (recovered) {
-                console.log('📨 [IMAP] 页面已恢复，继续等待新验证码...');
-            }
-        }
-
-        try {
-            let headers = await getImapAuthHeaders(false);
-            const response = await axios.get(url, {
-                headers
-            });
-            const messages = response.data.messages;
-            if (Array.isArray(messages) && messages.length > 0) {
-                const targetMessages = messages
-                    .filter(m =>
-                        m?.targetEmail?.toLowerCase() === normalizedEmail &&
-                        (m?.service === 'ChatGPT' || String(m?.subject || '').toLowerCase().includes('verification'))
-                    )
-                    .sort((a, b) => normalizeImapTimestamp(b) - normalizeImapTimestamp(a));
-
-                const targetMsg = targetMessages.find(m => String(m.code || '').trim() && String(m.code).trim() !== excludeCode)
-                    || targetMessages.find(m => String(m.code || '').trim());
-
-                if (targetMsg) {
-                    const code = String(targetMsg.code).trim();
-                    if (excludeCode && code === excludeCode) {
-                        // (静默) 仍是旧验证码
-                    } else {
-                        console.log(`📨 [IMAP] 已获取验证码: ${code}`);
-                        return code;
-                    }
-                }
-                // (静默) 暂未读取到新验证码
-            }
-            // (静默) 邮件列表为空
-        } catch (err) {
-            if (err.response && err.response.status === 401) {
-                console.warn('📨 [IMAP] 鉴权失败 (401)，正在强制刷新 Token 后重试...');
-                try {
-                    const headers = await getImapAuthHeaders(true);
-                    const retryResponse = await axios.get(url, { headers });
-                    const messages = retryResponse.data.messages;
-                    if (Array.isArray(messages) && messages.length > 0) {
-                        const targetMessages = messages
-                            .filter(m =>
-                                m?.targetEmail?.toLowerCase() === normalizedEmail &&
-                                (m?.service === 'ChatGPT' || String(m?.subject || '').toLowerCase().includes('verification'))
-                            )
-                            .sort((a, b) => normalizeImapTimestamp(b) - normalizeImapTimestamp(a));
-
-                        const targetMsg = targetMessages.find(m => String(m.code || '').trim() && String(m.code).trim() !== excludeCode)
-                            || targetMessages.find(m => String(m.code || '').trim());
-
-                        if (targetMsg) {
-                            const code = String(targetMsg.code).trim();
-                            if (excludeCode && code === excludeCode) {
-                                console.log(`📨 [IMAP] 当前最新验证码仍是旧值 ${code}，继续等待新验证码...`);
-                            } else {
-                                console.log(`📨 [IMAP] 成功获取验证码: ${code}`);
-                                return code;
-                            }
-                        } else {
-                            console.log('📨 [IMAP] 刷新 Token 后暂未读取到该邮箱的新验证码，继续轮询...');
-                        }
-                    } else {
-                        console.log('📨 [IMAP] 刷新 Token 后邮件列表为空，继续轮询...');
-                    }
-                } catch (refreshErr) {
-                    console.error(`📨 [IMAP] Token 刷新后轮询仍失败: ${refreshErr.message}`);
-                }
-            } else {
-                console.error(`📨 [IMAP] 本次轮询失败: ${err.message}`);
-            }
-        }
-
-        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
-            const now = Date.now();
-            if (now - lastResendAt >= 28000) {
-                lastResendAt = now;
-                await onNoNewCodeFor30Seconds();
-            }
-        }
-
-        for (let waitTick = 0; waitTick < 10; waitTick += 1) {
-            if (onBeforePoll) {
-                const recovered = await onBeforePoll(i + 1);
-                if (recovered) {
-                    console.log('📨 [IMAP] 页面恢复完成，保持旧验证码排除，继续等待新验证码...');
-                    break;
-                }
-            }
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
+    const inboxJwt = String(process.env.INBOX_JWT || '').trim();
+    const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
+    if (!inboxJwt || !inboxApiBase) {
+        throw new Error('CF Worker 邮箱上下文缺失，无法获取验证码');
     }
-    throw new Error('获取验证码超时');
-}
-
-async function getLatestCodeMicrosoftImap(email, credentials = {}, opts = {}) {
-    const maxRetries = Math.max(1, Number(opts.maxRetries || 24));
-    const excludeCode = String(opts.excludeCode || '');
-    const host = String(opts.host || 'outlook.office365.com').trim() || 'outlook.office365.com';
-    const includeJunk = opts.includeJunk !== false;
-    const password = String(credentials?.password || '');
-    const clientId = String(credentials?.clientId || '');
-    const refreshToken = String(credentials?.refreshToken || '');
-    const onNoNewCodeFor30Seconds = typeof opts.onNoNewCodeFor30Seconds === 'function'
-        ? opts.onNoNewCodeFor30Seconds
-        : null;
-    const onBeforePoll = typeof opts.onBeforePoll === 'function'
-        ? opts.onBeforePoll
-        : null;
-    let lastResendAt = 0;
-
-    const authMode = refreshToken && clientId ? 'OAuth2' : '密码';
-    console.log(`📨 [MS-IMAP] 正在为 ${email} 通过 ${host} 获取验证码（${authMode}，垃圾箱${includeJunk ? '已包含' : '未包含'}）...`);
-
-    for (let i = 0; i < maxRetries; i++) {
-        // 每 5 轮打印一次进度，避免刷屏
-        if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
-            console.log(`📨 [MS-IMAP] 轮询中 ${i + 1}/${maxRetries}...`);
-        }
-
-        if (onBeforePoll) {
-            const recovered = await onBeforePoll(i + 1);
-            if (recovered) {
-                console.log('📨 [MS-IMAP] 页面已恢复，继续等待新验证码...');
-            }
-        }
-
-        try {
-            const code = await fetchLatestOpenAiOtpOnce({
-                email,
-                password,
-                clientId,
-                refreshToken,
-                host,
-                includeJunk,
-                excludeCode
-            });
-
-            if (code) {
-                console.log(`📨 [IMAP] 成功获取验证码: ${code}`);
-                return code;
-            }
-
-            console.log('📨 [MS-IMAP] 暂未读取到符合条件的新验证码，继续轮询...');
-        } catch (err) {
-            console.error(`📨 [MS-IMAP] 本次轮询失败: ${err.message}`);
-        }
-
-        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
-            const now = Date.now();
-            if (now - lastResendAt >= 28000) {
-                lastResendAt = now;
-                await onNoNewCodeFor30Seconds();
-            }
-        }
-
-        for (let waitTick = 0; waitTick < 10; waitTick += 1) {
-            if (onBeforePoll) {
-                const recovered = await onBeforePoll(i + 1);
-                if (recovered) {
-                    console.log('📨 [MS-IMAP] 页面恢复完成，保持旧验证码排除，继续等待新验证码...');
-                    break;
-                }
-            }
-            await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-    }
-
-    throw new Error('获取验证码超时');
-}
-
-/**
- * 生成随机字母数字字符串
- */
-function generateRandomString(length) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
+    return inboxEmail.fetchLatestOpenAiOtp({
+        baseUrl: inboxApiBase,
+        jwt: inboxJwt,
+        address: normalizedEmail,
+        maxRetries,
+        excludeCode,
+        onNoNewCodeFor30Seconds: options.onNoNewCodeFor30Seconds || null,
+        onBeforePoll: options.onBeforePoll || null
+    });
 }
 
 function buildPlaywrightProxy(proxyValue) {
@@ -340,9 +133,7 @@ async function saveFailureScreenshot(page, prefix = 'register_openai_error') {
         return null;
     }
 
-    const screenshotDir = path.join(__dirname, 'debug_screenshots', '注册');
-    fs.mkdirSync(screenshotDir, { recursive: true });
-    const screenshotPath = path.join(screenshotDir, `${prefix}_${Date.now()}.png`);
+    const screenshotPath = buildDebugScreenshotPath('注册', prefix);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     console.log(`📸 [系统] 异常截图已保存: ${screenshotPath}`);
     return screenshotPath;
@@ -365,8 +156,10 @@ async function humanClick(page, selector) {
 async function clearAndType(page, selector, text) {
     const input = page.locator(selector).first();
     await input.waitFor({ state: 'visible', timeout: 30000 });
-    await input.click({ clickCount: 3 });
-    await input.fill('');
+    // OpenAI 新版 OTP 输入框上面套了一层浮动 label（_typeableLabelTextPositioner_）会拦截 click。
+    // 用 force:true 跳过命中检测，并把超时缩到 5s（30s 是 fill 的事，click 不需要那么长）。
+    await input.click({ clickCount: 3, force: true, timeout: 5000 }).catch(() => { });
+    await input.fill('').catch(() => { });
     await sleep(Math.random() * 400 + 150);
     await humanType(page, selector, text);
 }
@@ -489,6 +282,7 @@ async function waitForOtpInputReady(page, recoverOperationTimeout, recoverConnec
 
 // 模块级标记：合并页是否已经把姓名/年龄/生日填过；用于 Step 6 跳过重复填写。
 let __profileAlreadyFilled = false;
+let __registrationProfile = null;
 
 // 兼容多种 selector，新版页面 OpenAI 已经多次改过 input 的 name/id/autocomplete
 const NAME_SELECTORS = [
@@ -550,6 +344,53 @@ async function clickContinueButtonReliably(page, opts = {}) {
     const startUrl = String(opts.startUrl || page.url() || '');
     const maxAttempts = Math.max(1, Number(opts.maxAttempts || 3));
     const confirmTimeoutMs = Math.max(1000, Number(opts.confirmTimeoutMs || 5000));
+
+    const snapshotState = async () => {
+        const currentUrl = page.url();
+        const otpVisible = await (async () => {
+            for (const selector of OTP_INPUT_SELECTORS) {
+                if (await page.locator(selector).first().isVisible().catch(() => false)) {
+                    return true;
+                }
+            }
+            return false;
+        })();
+        const profileVisible = await (async () => {
+            for (const selector of NAME_SELECTORS) {
+                if (await page.locator(selector).first().isVisible().catch(() => false)) {
+                    return true;
+                }
+            }
+            return false;
+        })();
+        // 探测 OpenAI 错误页：Operation timed out / Try again / 糟糕，出错了
+        // 这些情况下原表单消失但页面是错的，不能算"成功推进"
+        const errorPageVisible = await (async () => {
+            try {
+                const bodyText = String(await page.textContent('body', { timeout: 1500 }).catch(() => '') || '').toLowerCase();
+                if (!bodyText) return false;
+                if (bodyText.includes('operation timed out')) return true;
+                if (bodyText.includes('糟糕')) return true;
+                // Try again 按钮单独出现 + 没有正常表单（OTP/邮箱/资料/聊天框都没）= 错误页
+                if (/try again|重试/.test(bodyText) && !otpVisible && !profileVisible) {
+                    const emailNow = await page.locator('input[type="email"]').first().isVisible().catch(() => false);
+                    const chatNow = await page.locator('textarea[name="prompt-textarea"]').first().isVisible().catch(() => false);
+                    if (!emailNow && !chatNow) return true;
+                }
+                return false;
+            } catch (_) {
+                return false;
+            }
+        })();
+        return {
+            url: currentUrl,
+            chatVisible: await page.locator('textarea[name="prompt-textarea"]').first().isVisible().catch(() => false),
+            emailVisible: await page.locator('input[type="email"]').first().isVisible().catch(() => false),
+            otpVisible,
+            profileVisible,
+            errorPageVisible
+        };
+    };
 
     // 真正的「Resend」识别：仅当 value=resend，不能简单按 name=intent 过滤（OpenAI 的 Continue 也带 name=intent）
     const isAcceptableTarget = async (loc) => {
@@ -692,6 +533,7 @@ async function clickContinueButtonReliably(page, opts = {}) {
         } catch (_) { }
         lastSelectorLabel = `候选#${candIdx + 1}  ${info}`;
         console.log(`👆 [Continue] 第 ${attempt}/${maxAttempts} 次点击：${lastSelectorLabel}`);
+        const beforeState = await snapshotState();
 
         // 鼠标悬停 + 模拟人手 click（force: true 避免被遮罩 / disabled 状态拦截）
         try {
@@ -705,24 +547,19 @@ async function clickContinueButtonReliably(page, opts = {}) {
         }
 
         // 点完等 URL 变化 / 聊天框出现 / 表单消失 任意一个先来
-        const settled = await Promise.race([
+        let settled = await Promise.race([
             page.waitForFunction(
                 (oldUrl) => location.href !== oldUrl,
                 startUrl,
                 { timeout: confirmTimeoutMs }
             ).then(() => 'urlChanged').catch(() => null),
             page.waitForSelector('textarea[name="prompt-textarea"]', { timeout: confirmTimeoutMs }).then(() => 'chatLoaded').catch(() => null),
-            (async () => {
-                // 点击后表单 input[name="email"] 消失也算
-                const wait = Date.now() + confirmTimeoutMs;
-                while (Date.now() < wait) {
-                    const stillForm = await page.locator('input[type="email"]').first().isVisible().catch(() => false);
-                    if (!stillForm) return 'formGone';
-                    await page.waitForTimeout(500);
-                }
-                return null;
-            })()
+            page.waitForSelector('input[name="name"]', { timeout: confirmTimeoutMs }).then(() => 'profileShown').catch(() => null)
         ]);
+
+        if (!settled) {
+            settled = detectRegistrationAdvance(beforeState, await snapshotState(), startUrl);
+        }
 
         if (settled) {
             console.log(`✅ [Continue] 第 ${attempt} 次点击生效（${settled}）`);
@@ -744,7 +581,7 @@ async function clickContinueButtonReliably(page, opts = {}) {
 
         if (inFlight) {
             console.log(`⏳ [Continue] 第 ${attempt} 次点击后表单进入 in-flight 状态（按钮灰/字段只读），延长等待 25s...`);
-            const ext = await Promise.race([
+            let ext = await Promise.race([
                 page.waitForFunction(
                     (oldUrl) => location.href !== oldUrl,
                     startUrl,
@@ -753,6 +590,9 @@ async function clickContinueButtonReliably(page, opts = {}) {
                 page.waitForSelector('textarea[name="prompt-textarea"]', { timeout: 25000 }).then(() => 'chatLoaded').catch(() => null),
                 page.waitForSelector('input[name="name"]', { timeout: 25000 }).then(() => 'profileShown').catch(() => null)
             ]);
+            if (!ext) {
+                ext = detectRegistrationAdvance(beforeState, await snapshotState(), startUrl);
+            }
             if (ext) {
                 console.log(`✅ [Continue] 延长等待后命中：${ext}`);
                 return { ok: true, attempt, settled: ext, selector: lastSelectorLabel };
@@ -860,27 +700,21 @@ async function fillProfileFieldsIfPresent(page, opts = {}) {
     }
 
     // 短姓名：First + 空格 + Last（11~14 字符内），更接近真人填写
-    const firstNames = ['James', 'Mary', 'John', 'Lisa', 'Tom', 'Anna', 'Mike', 'Eva', 'Will', 'Kate'];
-    const lastNames = ['Smith', 'Brown', 'Jones', 'Davis', 'Miller', 'Lee', 'Wilson', 'Walker', 'Hall', 'King'];
-    const randomName = `${firstNames[Math.floor(Math.random() * firstNames.length)]} ${lastNames[Math.floor(Math.random() * lastNames.length)]}`;
-    console.log(`📝 [资料] (${label}) 命中姓名输入框 ${nameField.selector}，填写: ${randomName}`);
-    await safeFillByValue(page, nameField.selector, randomName);
+    const profile = __registrationProfile || (__registrationProfile = createRegistrationProfile());
+    console.log(`📝 [资料] (${label}) 命中姓名输入框 ${nameField.selector}，填写: ${profile.name}`);
+    await safeFillByValue(page, nameField.selector, profile.name);
 
     const ageField = await findFirstVisible(page, AGE_SELECTORS, 0);
     if (ageField) {
-        const randomAge = (Math.floor(Math.random() * 25) + 20).toString();
-        console.log(`📝 [资料] (${label}) 命中年龄输入框 ${ageField.selector}，填写: ${randomAge}`);
-        await safeFillByValue(page, ageField.selector, randomAge);
+        console.log(`📝 [资料] (${label}) 命中年龄输入框 ${ageField.selector}，填写: ${profile.age}`);
+        await safeFillByValue(page, ageField.selector, profile.age);
     } else {
         // 优先检测「单输入框 MM/DD/YYYY」（新版 /about-you 用这种）
         const singleBday = await findFirstVisible(page, BIRTH_SINGLE_SELECTORS, 0);
         if (singleBday) {
-            const year = (Math.floor(Math.random() * 25) + 1980); // 1980 ~ 2004
-            const month = Math.floor(Math.random() * 12) + 1;
-            const day = Math.floor(Math.random() * 28) + 1;
-            const mm = String(month).padStart(2, '0');
-            const dd = String(day).padStart(2, '0');
-            const yyyy = String(year);
+            const mm = profile.month;
+            const dd = profile.day;
+            const yyyy = profile.year;
             // 输入裸数字 8 位 MMDDYYYY，由页面自动格式化成 MM/DD/YYYY
             const raw = `${mm}${dd}${yyyy}`;
             console.log(`📝 [资料] (${label}) 命中生日单输入框 ${singleBday.selector}，输入: ${mm}/${dd}/${yyyy}`);
@@ -909,14 +743,11 @@ async function fillProfileFieldsIfPresent(page, opts = {}) {
             if (yearField) {
                 const monthField = await findFirstVisible(page, BIRTH_MONTH_SELECTORS, 0);
                 const dayField = await findFirstVisible(page, BIRTH_DAY_SELECTORS, 0);
-                const year = (Math.floor(Math.random() * 25) + 1980).toString();
-                const month = (Math.floor(Math.random() * 12) + 1).toString().padStart(2, '0');
-                const day = (Math.floor(Math.random() * 28) + 1).toString().padStart(2, '0');
-                console.log(`📝 [资料] (${label}) 命中生日分段输入，填写: ${year}/${month}/${day}`);
+                console.log(`📝 [资料] (${label}) 命中生日分段输入，填写: ${profile.year}/${profile.month}/${profile.day}`);
                 // 注意：分段时按 month → day → year 的常见 DOM 顺序填，避免顺序错位
-                if (monthField) await safeFillByValue(page, monthField.selector, month);
-                if (dayField) await safeFillByValue(page, dayField.selector, day);
-                await safeFillByValue(page, yearField.selector, year);
+                if (monthField) await safeFillByValue(page, monthField.selector, profile.month);
+                if (dayField) await safeFillByValue(page, dayField.selector, profile.day);
+                await safeFillByValue(page, yearField.selector, profile.year);
             } else {
                 console.warn(`⚠️  [资料] (${label}) 未识别到年龄/生日输入，仅填了姓名`);
             }
@@ -930,7 +761,7 @@ async function fillProfileFieldsIfPresent(page, opts = {}) {
 async function submitOtpWithRetry(page, email, maxAttempts = MAX_OTP_RETRIES, options = {}) {
     const normalizedEmail = normalizeCloudEmail(email);
     const customFetchCode = typeof options.fetchCode === 'function' ? options.fetchCode : null;
-    let lastCode = '';
+    const attemptedCodes = new Set();
     const beforeAttempt = typeof options.beforeAttempt === 'function' ? options.beforeAttempt : null;
     const waitForOtpInput = typeof options.waitForOtpInput === 'function' ? options.waitForOtpInput : null;
 
@@ -955,12 +786,12 @@ async function submitOtpWithRetry(page, email, maxAttempts = MAX_OTP_RETRIES, op
         };
 
         const code = customFetchCode
-            ? await customFetchCode(lastCode, pollOpts)
-            : await getLatestCode(normalizedEmail, pollOpts.maxRetries, lastCode, {
+            ? await customFetchCode([...attemptedCodes], pollOpts)
+            : await getLatestCode(normalizedEmail, pollOpts.maxRetries, [...attemptedCodes], {
                 onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
                 onBeforePoll: pollOpts.onBeforePoll
             });
-        lastCode = code;
+        attemptedCodes.add(String(code || '').trim());
         if (beforeAttempt) {
             await beforeAttempt(attempt);
         }
@@ -1014,6 +845,34 @@ async function submitOtpWithRetry(page, email, maxAttempts = MAX_OTP_RETRIES, op
             throw new Error(USER_ALREADY_EXISTS_ERROR);
         }
 
+        // 关键：clickContinueButtonReliably 可能因为 OTP 框消失（otpGone）误判为成功，
+        // 但实际页面已落到 OpenAI 错误页（Operation timed out / Try again）。
+        // 必须在判定 OTP 是否被接受之前先恢复错误页，否则会把当前 OTP 当成功 return 给上层
+        // 上层 Step 6 进入 chatgpt 等待时就会卡死。
+        const recoverErr = typeof options.recoverOperationTimeout === 'function'
+            ? options.recoverOperationTimeout
+            : null;
+        if (recoverErr) {
+            try {
+                if (await recoverErr()) {
+                    if (attempt < maxAttempts) {
+                        console.warn(`🔑 [OTP] 检测到 OpenAI 错误页，已触发恢复流程，准备重新获取新验证码 (${attempt}/${maxAttempts})...`);
+                        continue;
+                    }
+                    throw new Error(OTP_RETRY_EXCEEDED_ERROR);
+                }
+            } catch (e) {
+                if (e && e.message && e.message.includes('代理或网络持续超时')) {
+                    throw e;
+                }
+                // recoverErr 内部抛错（如超过最大恢复次数）就让其继续往上抛
+                if (e && e.message === OTP_RETRY_EXCEEDED_ERROR) {
+                    throw e;
+                }
+                console.warn(`⚠️  [OTP] 错误页恢复异常: ${e.message}`);
+            }
+        }
+
         if (!(await isOtpIncorrect(page))) {
             return code;
         }
@@ -1039,7 +898,11 @@ async function runRegistrationFlow() {
     const poolImapHost = String(process.env.POOL_EMAIL_IMAP_HOST || 'outlook.office365.com').trim() || 'outlook.office365.com';
     const poolIncludeJunk = String(process.env.POOL_EMAIL_INCLUDE_JUNK || '1') !== '0';
 
-    const emailSource = String(process.env.EMAIL_SOURCE || 'random').toLowerCase();
+    const configuredEmailSource = String(process.env.EMAIL_SOURCE || 'inbox').toLowerCase();
+    if (configuredEmailSource !== 'inbox') {
+        console.warn(`⚠️  [邮箱] 已忽略 email_source=${configuredEmailSource}，当前版本统一使用 CF Worker 收件`);
+    }
+    const emailSource = 'inbox';
     const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
     const inboxAdminPassword = String(process.env.INBOX_ADMIN_PASSWORD || '').trim();
     const inboxEmailDomain = String(process.env.INBOX_EMAIL_DOMAIN || '').trim().replace(/^@/, '');
@@ -1063,18 +926,12 @@ async function runRegistrationFlow() {
         console.warn(`⚠️  [系统] 无法从后端获取代理配置: ${e.message}`);
     }
 
-    const hasOauth = Boolean(poolEmailId && rawPoolEmail && poolClientId && poolRefreshToken);
-    const hasPlainPwd = Boolean(poolEmailId && rawPoolEmail && poolImapPass);
-    const usePoolImap = (emailSource === 'pool') && (hasOauth || hasPlainPwd);
     const useInbox = emailSource === 'inbox';
+    const registrationProfile = __registrationProfile || (__registrationProfile = createRegistrationProfile());
 
     let email = '';
     let inboxJwt = '';
-    if (usePoolImap) {
-        email = rawPoolEmail;
-        console.log(`📬 [邮箱池] 使用预留邮箱 ${email}`);
-        console.log(`📡 [邮箱池] 主机 ${poolImapHost}  ·  认证 ${hasOauth ? '🔐 OAuth2' : '🔑 密码'}`);
-    } else if (useInbox) {
+    if (useInbox) {
         // 候选域名按顺序尝试，被服务端拒绝的（HTTP 400 Invalid domain）自动跳过
         // 全部都不行就退到"不指定域名"让 API 用默认值
         const tryOrder = inboxEmailDomainsList.length > 0
@@ -1083,16 +940,17 @@ async function runRegistrationFlow() {
         tryOrder.push(''); // 兜底：让 API 自己选
 
         let lastErr = null;
-        let usedDomain = '';
-        for (const tryDomain of tryOrder) {
-            try {
-                const newInbox = await inboxEmail.createAddress({
-                    baseUrl: inboxApiBase,
-                    adminPassword: inboxAdminPassword,
-                    domain: tryDomain || undefined
-                });
-                email = newInbox.address;
-                inboxJwt = newInbox.jwt;
+            let usedDomain = '';
+            for (const tryDomain of tryOrder) {
+                try {
+                    const newInbox = await inboxEmail.createAddress({
+                        baseUrl: inboxApiBase,
+                        adminPassword: inboxAdminPassword,
+                        name: registrationProfile.emailLocalPart,
+                        domain: tryDomain || undefined
+                    });
+                    email = newInbox.address;
+                    inboxJwt = newInbox.jwt;
                 usedDomain = tryDomain || '默认';
                 break;
             } catch (e) {
@@ -1117,7 +975,7 @@ async function runRegistrationFlow() {
         console.log(`📨 [Inbox] 临时邮箱已创建: ${email} ${domainHint}`);
     } else {
         const randomDomain = getRandomEmailDomain();
-        email = normalizeCloudEmail(`${generateRandomString(15).toLowerCase()}@${randomDomain}`);
+        email = normalizeCloudEmail(`${registrationProfile.emailLocalPart}@${randomDomain}`);
         console.log(`🎲 [随机邮箱] 本次使用 ${email}`);
     }
 
@@ -1161,6 +1019,46 @@ async function runRegistrationFlow() {
             console.log("🌐 [系统] 未配置代理，使用本机出口直连。");
         }
 
+        // 从原始代理 URL 中解析出代理出口地区，用于让浏览器 timezone / locale 跟实际出口对齐。
+        // 代理 url 形如 socks5://user-region-US-st-California:pwd@host:port 或 region-JP-st-Tokyo
+        // 时区/语言不匹配是 OpenAI 风控的重要因子（New_York + JP IP 必然进 Try again）。
+        const fingerprint = (() => {
+            const fallback = { timezoneId: 'America/New_York', locale: 'en-US' };
+            try {
+                const raw = String(proxyValue || '');
+                if (!raw) return fallback;
+                const regionMatch = raw.match(/region-([a-z]{2,3})/i);
+                const region = regionMatch ? regionMatch[1].toUpperCase() : '';
+                const map = {
+                    US: { timezoneId: 'America/New_York', locale: 'en-US' },
+                    CA: { timezoneId: 'America/Toronto', locale: 'en-CA' },
+                    GB: { timezoneId: 'Europe/London', locale: 'en-GB' },
+                    UK: { timezoneId: 'Europe/London', locale: 'en-GB' },
+                    DE: { timezoneId: 'Europe/Berlin', locale: 'de-DE' },
+                    FR: { timezoneId: 'Europe/Paris', locale: 'fr-FR' },
+                    JP: { timezoneId: 'Asia/Tokyo', locale: 'ja-JP' },
+                    KR: { timezoneId: 'Asia/Seoul', locale: 'ko-KR' },
+                    SG: { timezoneId: 'Asia/Singapore', locale: 'en-SG' },
+                    HK: { timezoneId: 'Asia/Hong_Kong', locale: 'en-HK' },
+                    TW: { timezoneId: 'Asia/Taipei', locale: 'zh-TW' },
+                    AU: { timezoneId: 'Australia/Sydney', locale: 'en-AU' },
+                    IN: { timezoneId: 'Asia/Kolkata', locale: 'en-IN' },
+                    BR: { timezoneId: 'America/Sao_Paulo', locale: 'pt-BR' },
+                    NL: { timezoneId: 'Europe/Amsterdam', locale: 'nl-NL' }
+                };
+                if (region && map[region]) {
+                    console.log(`🌐 [系统] 代理出口 region=${region} → timezone=${map[region].timezoneId}, locale=${map[region].locale}`);
+                    return map[region];
+                }
+                if (region) {
+                    console.log(`🌐 [系统] 代理出口 region=${region} 未在内置映射中，回退默认 ${fallback.timezoneId}`);
+                }
+                return fallback;
+            } catch (_) {
+                return fallback;
+            }
+        })();
+
         browser = await chromium.launch(launchOptions);
 
         // 取浏览器真实 UA，避免与 Client Hints 不一致（hCaptcha invisible 会查这个一致性）
@@ -1184,11 +1082,12 @@ async function runRegistrationFlow() {
             userAgent: realUserAgent,
             viewport: { width: 1280, height: 720 },
             deviceScaleFactor: 1,
-            locale: 'en-US',
-            timezoneId: 'America/New_York',
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezoneId,
             isMobile: false,
             hasTouch: false,
             extraHTTPHeaders: {
+                'accept-language': `${fingerprint.locale},${(fingerprint.locale.split('-')[0] || 'en')};q=0.9`,
                 'sec-ch-ua': `"Not)A;Brand";v="8", "Chromium";v="${chromeMajorReg}", "Google Chrome";v="${chromeMajorReg}"`,
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"'
@@ -1196,7 +1095,7 @@ async function runRegistrationFlow() {
         });
 
         // 与 index.js 同款的严格指纹伪装（保持注册/支付两端指纹一致）
-        await context.addInitScript((injectedChromeMajor) => {
+        await context.addInitScript(({ injectedChromeMajor, injectedLocale }) => {
             const NavProto = Object.getPrototypeOf(navigator);
             const ScrProto = Object.getPrototypeOf(screen);
             const safeDefine = (obj, key, getter) => {
@@ -1258,8 +1157,12 @@ async function runRegistrationFlow() {
                 safeDefine(NavProto, 'mimeTypes', () => fakeMimeTypes);
             } catch (_) { }
 
-            safeDefine(NavProto, 'languages', () => ['en-US', 'en']);
-            safeDefine(NavProto, 'language', () => 'en-US');
+            safeDefine(NavProto, 'languages', () => {
+                const primary = String(injectedLocale || 'en-US');
+                const base = primary.split('-')[0] || 'en';
+                return primary === base ? [primary] : [primary, base];
+            });
+            safeDefine(NavProto, 'language', () => String(injectedLocale || 'en-US'));
             safeDefine(NavProto, 'platform', () => 'Win32');
             safeDefine(NavProto, 'hardwareConcurrency', () => 8);
             safeDefine(NavProto, 'deviceMemory', () => 8);
@@ -1379,14 +1282,32 @@ async function runRegistrationFlow() {
                     }
                 }
             } catch (_) { }
-        }, chromeMajorReg);
+        }, { injectedChromeMajor: chromeMajorReg, injectedLocale: fingerprint.locale });
 
         page = await context.newPage();
 
         const isOperationTimedOutPage = async () => {
             try {
                 const bodyText = await page.textContent('body', { timeout: 3000 }).catch(() => "");
-                return bodyText.includes('Operation timed out') || bodyText.includes('糟糕，出错了');
+                if (!bodyText) return false;
+                if (bodyText.includes('Operation timed out')) return true;
+                if (bodyText.includes('糟糕，出错了')) return true;
+                // OpenAI 现在的错误页有时只显示一个 "Try again" 按钮 + 简短文字（无 "Operation timed out" 关键字）。
+                // 通过"页面上几乎只剩 Try again 按钮、原表单全消失"来识别这种轻量错误页，避免误判已成功跳转。
+                const url = page.url();
+                if (!/auth\.openai\.com\/(email-verification|create-account|log-in)/i.test(url)) {
+                    return false;
+                }
+                if (!/try again|重试/i.test(bodyText)) {
+                    return false;
+                }
+                const otpStillThere = await page.locator('input[autocomplete="one-time-code"], input[name="code"]').first().isVisible().catch(() => false);
+                if (otpStillThere) return false;
+                const emailStillThere = await page.locator('input[type="email"]').first().isVisible().catch(() => false);
+                if (emailStillThere) return false;
+                const profileStillThere = await page.locator('input[name="name"], input[autocomplete="bday"]').first().isVisible().catch(() => false);
+                if (profileStillThere) return false;
+                return true;
             } catch (_) {
                 return false;
             }
@@ -1418,7 +1339,8 @@ async function runRegistrationFlow() {
             await sleep(Math.random() * 1200 + 600);
             console.log("ℹ️  [Info] 超时恢复：正在重新输入邮箱...");
             await ensureInputValue(page, 'input[type="email"]', email, '邮箱输入框');
-            await sleep(Math.random() * 800 + 500);
+            // 邮箱输入完后留 3-3.6s 拟人停顿，再点击进入验证码页（避免触发 OpenAI 节流/反自动化）
+            await sleep(3000 + Math.random() * 600);
             await humanClick(page, 'button[type="submit"]');
         };
 
@@ -1481,7 +1403,8 @@ async function runRegistrationFlow() {
                     console.log("ℹ️  [Info] 超时恢复：邮箱页已加载完成，正在重新输入邮箱...");
                     await sleep(Math.random() * 1200 + 600);
                     await ensureInputValue(page, 'input[type="email"]', email, '邮箱输入框');
-                    await sleep(Math.random() * 800 + 500);
+                    // 同 Step 4：输入完邮箱后强制 ≥ 3s 再点提交
+                    await sleep(3000 + Math.random() * 600);
                     await humanClick(page, 'button[type="submit"]');
                     await page.waitForTimeout(1500);
 
@@ -1667,7 +1590,8 @@ async function runRegistrationFlow() {
         await sleep(Math.random() * 1500 + 1000);
         await ensureInputValue(page, 'input[type="email"]', email, '邮箱输入框');
 
-        await sleep(Math.random() * 1000 + 800); // 拟人提交前停顿
+        // 邮箱输入完后强制 ≥ 3s 再点击提交，避免 OpenAI 端识别为机器人节流（间隔太短会进 Try again）
+        await sleep(3000 + Math.random() * 600);
         await humanClick(page, 'button[type="submit"]');
 
         console.log("⏳ [等待] 正在检测下一步流程（验证码 / 创建密码 / 合并页）...");
@@ -1708,36 +1632,21 @@ async function runRegistrationFlow() {
 
         await findVisibleOtpSelector(page, 30000);
         await sleep(Math.random() * 1500 + 1000);
-        let fetchCodeFn;
-        if (usePoolImap) {
-            fetchCodeFn = async (excludeCode, pollOpts) => getLatestCodeMicrosoftImap(email, {
-                password: poolImapPass,
-                clientId: poolClientId,
-                refreshToken: poolRefreshToken
-            }, {
-                host: poolImapHost,
-                includeJunk: poolIncludeJunk,
-                maxRetries: pollOpts.maxRetries,
-                excludeCode,
-                onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
-                onBeforePoll: pollOpts.onBeforePoll
-            });
-        } else if (useInbox) {
-            fetchCodeFn = async (excludeCode, pollOpts) => inboxEmail.fetchLatestOpenAiOtp({
-                baseUrl: inboxApiBase,
-                jwt: inboxJwt,
-                address: email,
-                maxRetries: pollOpts.maxRetries,
-                excludeCode,
-                onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
-                onBeforePoll: pollOpts.onBeforePoll
-            });
-        }
+        const fetchCodeFn = async (excludeCode, pollOpts) => inboxEmail.fetchLatestOpenAiOtp({
+            baseUrl: inboxApiBase,
+            jwt: inboxJwt,
+            address: email,
+            maxRetries: pollOpts.maxRetries,
+            excludeCode,
+            onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
+            onBeforePoll: pollOpts.onBeforePoll
+        });
 
         await submitOtpWithRetry(page, email, MAX_OTP_RETRIES, {
             fetchCode: fetchCodeFn,
             beforeAttempt: async () => recoverOperationTimeout(),
-            waitForOtpInput: async () => waitForOtpInputReady(page, recoverOperationTimeout, recoverConnectionClosed, 45000)
+            waitForOtpInput: async () => waitForOtpInputReady(page, recoverOperationTimeout, recoverConnectionClosed, 45000),
+            recoverOperationTimeout
         });
 
         console.log("📝 [Step 6] 正在完善个人资料（如果需要）...");

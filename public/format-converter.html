@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FLYGPT PLUS | 格式转换</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+    </div>
+
+    <main class="converter-page-shell">
+        <section class="glass-container converter-page-card is-convert-mode">
+            <div class="top-entry-bar top-entry-bar-between">
+                <a class="top-entry-link top-entry-link-muted" href="/">返回首页</a>
+                <div class="top-entry-title">格式转换</div>
+            </div>
+
+            <header class="converter-page-header">
+                <div>
+                    <p class="converter-page-subtitle">支持 JSON / JSONL / sub2api / CPA 输入，快速导出目标格式。</p>
+                </div>
+            </header>
+
+            <div class="convert-grid">
+                <section class="convert-panel">
+                    <div class="convert-panel-head">
+                        <div>
+                            <h3>输入内容</h3>
+                            <span id="convertDetect" class="convert-panel-subtitle">等待输入</span>
+                        </div>
+                        <div class="convert-stats">
+                            <div class="convert-stat">
+                                <span>记录</span>
+                                <strong id="convertCount">0</strong>
+                            </div>
+                            <div class="convert-stat">
+                                <span>回填</span>
+                                <strong id="convertBackfill">0</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <textarea id="convertInput" class="convert-textarea" placeholder="支持 unified JSONL、Codex JSON/JSONL、sub2api bundle JSON、CPA JSON。"></textarea>
+
+                    <div class="convert-toolbar convert-toolbar-inline">
+                        <label class="convert-field">
+                            <span>输出模式</span>
+                            <select id="convertMode">
+                                <option value="to-sub">转 sub2api</option>
+                                <option value="to-cpa">转 CPA</option>
+                                <option value="normalize">标准化 JSONL</option>
+                            </select>
+                        </label>
+
+                        <div class="convert-inline-action">
+                            <span>导入文件</span>
+                            <label id="convertFileTrigger" class="convert-inline-btn" for="convertFile">选择文件</label>
+                            <input id="convertFile" type="file" accept=".json,.jsonl,.txt" hidden>
+                        </div>
+                    </div>
+
+                    <div class="convert-actions">
+                        <button id="convertRunBtn" type="button" class="btn-primary">开始转换</button>
+                        <button id="convertClearBtn" type="button" class="btn-secondary">清空</button>
+                    </div>
+
+                    <div id="convertError" class="convert-error"></div>
+                </section>
+
+                <section class="convert-panel">
+                    <div class="convert-panel-head">
+                        <div>
+                            <h3>输出预览</h3>
+                            <span id="convertMeta" class="convert-panel-subtitle">尚未生成</span>
+                        </div>
+                    </div>
+
+                    <pre id="convertOutput" class="convert-output"></pre>
+
+                    <div class="convert-actions">
+                        <button id="convertCopyBtn" type="button" class="btn-secondary" disabled>复制预览</button>
+                        <button id="convertDownloadBtn" type="button" class="btn-primary" disabled>下载结果</button>
+                    </div>
+
+                    <p id="convertSummary" class="convert-summary">支持 JSON、JSONL、sub2api、CPA 输入。</p>
+                </section>
+            </div>
+        </section>
+    </main>
+
+    <script src="/format-converter.js"></script>
+    <script>
+        if (window.FormatConverter && typeof window.FormatConverter.initFormatConverter === 'function') {
+            window.FormatConverter.initFormatConverter();
+        }
+        lucide.createIcons();
+    </script>
+</body>
+
+</html>

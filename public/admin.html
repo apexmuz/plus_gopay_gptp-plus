@@ -2413,7 +2413,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                         <i data-lucide="square"></i>
                         停止成品批量生产
                     </button>
-                    <span class="log-page-toolbar-hint">默认每 3 秒自动拉取概览与下方表格；停止后仅在你点击「立即刷新」时更新。可在表格中删除单条任务记录。「停止成品批量」仅针对后台批量成品任务；前台自助开通由子进程执行，无法在此强制杀进程，可开维护模式拒绝新单。</span>
+                    <span class="log-page-toolbar-hint">默认每 3 秒自动拉取概览与下方表格；停止后仅在你点击「立即刷新」时更新。表格中的运行中任务可单独发送停止指令；「停止成品批量」用于当前后台批量生产 Job。</span>
                 </div>
                 <div class="table-container">
                     <table>
@@ -2734,6 +2734,39 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 }
                 const n = Number(data.stopped || 0);
                 showMessage(data.message || '操作完成', n > 0 ? 'success' : 'warning');
+            } catch (e) {
+                showMessage(e.message || '停止失败', 'error');
+            }
+            lucide.createIcons();
+        }
+
+        async function stopAdminTask(jobKey) {
+            const key = String(jobKey || '').trim();
+            if (!key) {
+                return;
+            }
+            const ok = await showAdminConfirm(
+                `确定向任务「${key}」发送停止指令？任务会在当前安全步骤尽快退出。`,
+                '停止任务'
+            );
+            if (!ok) {
+                return;
+            }
+            try {
+                const res = await authFetch(`/api/admin/task-logs/${encodeURIComponent(key)}/stop`, {
+                    method: 'POST'
+                });
+                let data = {};
+                try {
+                    data = await res.json();
+                } catch (_) {
+                    /* ignore */
+                }
+                if (!res.ok) {
+                    throw new Error(data.message || `停止失败（${res.status}）`);
+                }
+                showMessage(data.message || '已发送停止指令', Number(data.stopped || 0) > 0 ? 'success' : 'warning');
+                await loadData();
             } catch (e) {
                 showMessage(e.message || '停止失败', 'error');
             }
@@ -3419,6 +3452,9 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                     resumeBtn.title = String(data.stats.product_resume_message || '');
                 }
 
+                window.__adminProductGenJobKey = String(data.stats.product_running_job_key || '');
+                setProductGenStopVisible(Boolean(window.__adminProductGenJobKey));
+
                 if (isInitial) {
                     document.getElementById('proxy').value = data.config.proxy || '';
                     document.getElementById('max_concurrent_activations').value = data.config.max_concurrent_activations || 1;
@@ -3846,7 +3882,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                         </div>
                     </td>
                     <td>${renderStatus(l.status)}</td>
-                    <td style="text-align:center"><button type="button" class="btn-delete" title="删除此任务记录" onclick='deleteAdminTaskLog(${JSON.stringify(l.id)})'><i data-lucide="trash-2"></i></button></td>
+                    <td style="text-align:center">
+                        ${l.status === 'running' ? `<button type="button" class="btn btn-delete" title="停止此任务" style="padding:8px 10px;margin-right:8px;border-radius:10px;" onclick='stopAdminTask(${JSON.stringify(l.id)})'><i data-lucide="square"></i></button>` : ''}
+                        <button type="button" class="btn-delete" title="删除此任务记录" onclick='deleteAdminTaskLog(${JSON.stringify(l.id)})'><i data-lucide="trash-2"></i></button>
+                    </td>
                 </tr>
             `).join('');
             renderPagination('log_pagination', 'log', pageData.total);
