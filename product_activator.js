@@ -703,23 +703,32 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '', stopContro
 
     let emailSource = 'inbox';
     try {
-        const configuredEmailSource = String(await store.getAppConfigValue('email_source', 'inbox')).toLowerCase();
-        if (configuredEmailSource !== 'inbox') {
-            console.warn(`[Registration] 已忽略 email_source=${configuredEmailSource}，当前版本统一使用 CF Worker 收件`);
+        emailSource = String(await store.getAppConfigValue('email_source', '')).toLowerCase();
+        if (!['pool', 'inbox'].includes(emailSource)) {
+            const legacy = String(await store.getAppConfigValue('pool_email_enabled', '0')) === '1';
+            emailSource = legacy ? 'pool' : 'inbox';
         }
     } catch (_) { /* 用默认 */ }
+
+    try {
+        if (emailSource === 'pool') {
+            poolSlot = await store.reservePoolEmail(ownerKey);
+            if (!poolSlot) {
+                console.warn('[Registration] 邮箱池暂无可用邮箱，回退 inbox 模式继续');
+                emailSource = 'inbox';
+            }
+        }
+    } catch (err) {
+        console.warn(`[Registration] 邮箱池预留失败，回退 inbox 模式继续: ${err.message}`);
+        emailSource = 'inbox';
+    }
 
     const childEnv = { ...process.env };
 
     // 邮箱来源标记
     childEnv.EMAIL_SOURCE = emailSource;
 
-    // 自定义随机邮箱域名（注册流程不论是否走 pool 都把它带上，方便子进程后续兼容）
-    const randomDomainCfg = String(await store.getAppConfigValue('random_email_domain', 'chiyiyi.cloud'))
-        .trim().replace(/^@/, '').toLowerCase() || 'chiyiyi.cloud';
-    childEnv.RANDOM_EMAIL_DOMAIN = randomDomainCfg;
-
-    // Inbox 临时邮箱配置（仅 inbox 模式下生效，提前注入避免子进程再查 DB）
+    // Worker 邮箱配置（仅 inbox 模式）
     if (emailSource === 'inbox') {
         childEnv.INBOX_API_BASE = String(await store.getAppConfigValue('inbox_api_base', 'https://temp-email-api.jzqkwl.com'))
             .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
@@ -788,8 +797,22 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '', stopContro
             throw new Error(result.error || '注册流程未返回有效账号信息');
         }
 
+        const enrichedResult = {
+            ...result.result,
+            emailSource
+        };
+        if (emailSource === 'pool' && poolSlot) {
+            enrichedResult.poolEmailId = poolSlot.id;
+            enrichedResult.poolEmail = poolSlot.email;
+            enrichedResult.poolEmailPassword = poolSlot.password || '';
+            enrichedResult.poolEmailClientId = poolSlot.clientId || '';
+            enrichedResult.poolEmailRefreshToken = poolSlot.refreshToken || '';
+            enrichedResult.poolEmailImapHost = childEnv.POOL_EMAIL_IMAP_HOST || '';
+            enrichedResult.poolEmailIncludeJunk = childEnv.POOL_EMAIL_INCLUDE_JUNK || '';
+        }
+
         onProgress({ progress: 20, message: `账号注册成功: ${result.result.email}，准备开始激活...` });
-        return result.result;
+        return enrichedResult;
     } catch (error) {
         if (poolSlot?.id) {
             await store.releasePoolEmailReservation(poolSlot.id).catch(() => { });
@@ -801,19 +824,37 @@ async function runRegistrationProcess(onProgress, runtimeJobKey = '', stopContro
 async function runProtocolProcess(email, onProgress, runtimeJobKey = '', inboxBundle = {}, stopController = null) {
     let lastError = '';
 
-    let randomDomainCfg = 'chiyiyi.cloud';
-    try {
-        randomDomainCfg = String(await store.getAppConfigValue('random_email_domain', 'chiyiyi.cloud'))
-            .trim().replace(/^@/, '').toLowerCase() || 'chiyiyi.cloud';
-    } catch (_) { /* 忽略，使用默认 */ }
-    const protocolEnv = { ...process.env, RANDOM_EMAIL_DOMAIN: randomDomainCfg };
-    // 把注册阶段的邮箱后端凭证透传给 oauth_login，让它用同一个 API 拿 OAuth 验证码
-    protocolEnv.EMAIL_SOURCE = 'inbox';
+    const protocolEnv = { ...process.env };
+    // 把注册阶段的邮箱后端凭证透传给 oauth_login，让它用同一个邮箱后端拿 OAuth 验证码
+    if (inboxBundle.emailSource) {
+        protocolEnv.EMAIL_SOURCE = inboxBundle.emailSource;
+    }
     if (inboxBundle.inboxJwt) {
         protocolEnv.INBOX_JWT = inboxBundle.inboxJwt;
     }
     if (inboxBundle.inboxApiBase) {
         protocolEnv.INBOX_API_BASE = inboxBundle.inboxApiBase;
+    }
+    if (inboxBundle.poolEmailId) {
+        protocolEnv.POOL_EMAIL_ID = String(inboxBundle.poolEmailId);
+    }
+    if (inboxBundle.poolEmail) {
+        protocolEnv.POOL_EMAIL = inboxBundle.poolEmail;
+    }
+    if (typeof inboxBundle.poolEmailPassword === 'string') {
+        protocolEnv.POOL_EMAIL_PASSWORD = inboxBundle.poolEmailPassword;
+    }
+    if (typeof inboxBundle.poolEmailClientId === 'string') {
+        protocolEnv.POOL_EMAIL_CLIENT_ID = inboxBundle.poolEmailClientId;
+    }
+    if (typeof inboxBundle.poolEmailRefreshToken === 'string') {
+        protocolEnv.POOL_EMAIL_REFRESH_TOKEN = inboxBundle.poolEmailRefreshToken;
+    }
+    if (inboxBundle.poolEmailImapHost) {
+        protocolEnv.POOL_EMAIL_IMAP_HOST = inboxBundle.poolEmailImapHost;
+    }
+    if (inboxBundle.poolEmailIncludeJunk) {
+        protocolEnv.POOL_EMAIL_INCLUDE_JUNK = inboxBundle.poolEmailIncludeJunk;
     }
 
     for (let attempt = 1; attempt <= CONFIG.MAX_PROTOCOL_RETRIES; attempt += 1) {
@@ -903,7 +944,14 @@ async function startProductCreation(cdk, progressCallback, options = {}) {
             const inboxBundle = {
                 emailSource: regResult.emailSource || '',
                 inboxJwt: regResult.inboxJwt || '',
-                inboxApiBase: regResult.inboxApiBase || ''
+                inboxApiBase: regResult.inboxApiBase || '',
+                poolEmailId: regResult.poolEmailId || 0,
+                poolEmail: regResult.poolEmail || '',
+                poolEmailPassword: regResult.poolEmailPassword || '',
+                poolEmailClientId: regResult.poolEmailClientId || '',
+                poolEmailRefreshToken: regResult.poolEmailRefreshToken || '',
+                poolEmailImapHost: regResult.poolEmailImapHost || '',
+                poolEmailIncludeJunk: regResult.poolEmailIncludeJunk || ''
             };
 
             let activationAttempt = 0;

@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const inboxEmail = require('./inbox-email');
+const { fetchLatestOpenAiOtpOnce } = require('./pool-email-imap');
 const { buildDebugScreenshotPath } = require('./debug-artifacts');
 const {
     needsPlaywrightProxyBridge,
@@ -131,41 +132,86 @@ async function buildAxiosTransportConfig(proxyValue) {
     };
 }
 
-/**
- * 获取验证码的工具函数
- */
-function getRandomEmailDomain() {
-    return String(process.env.RANDOM_EMAIL_DOMAIN || 'chiyiyi.cloud')
-        .trim()
-        .replace(/^@/, '')
-        .toLowerCase()
-        || 'chiyiyi.cloud';
-}
-
-function escapeRegex(str) {
-    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function normalizeCloudEmail(email) {
-    let normalized = String(email || '').trim().toLowerCase();
-    if (!normalized) {
-        return normalized;
-    }
-
-    const domain = getRandomEmailDomain();
-    const dupRe = new RegExp(`@${escapeRegex(domain)}(?:\\.${escapeRegex(domain.split('.').pop() || '')})+$`, 'i');
-    normalized = normalized.replace(dupRe, `@${domain}`);
-    if (!normalized.includes('@')) {
-        normalized = `${normalized}@${domain}`;
-    }
-
-    return normalized;
-}
-
 async function getLatestCode(email, maxRetries = 30, excludeCode = '', options = {}) {
-    const normalizedEmail = normalizeCloudEmail(email);
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const emailSource = String(process.env.EMAIL_SOURCE || '').toLowerCase();
     const inboxJwt = String(process.env.INBOX_JWT || '');
     const inboxApiBase = String(process.env.INBOX_API_BASE || '').trim().replace(/\/+$/, '');
+    const poolEmail = String(process.env.POOL_EMAIL || '').trim().toLowerCase();
+    const poolImapPass = String(process.env.POOL_EMAIL_PASSWORD || '');
+    const poolClientId = String(process.env.POOL_EMAIL_CLIENT_ID || '');
+    const poolRefreshToken = String(process.env.POOL_EMAIL_REFRESH_TOKEN || '');
+    const poolImapHost = String(process.env.POOL_EMAIL_IMAP_HOST || 'outlook.office365.com').trim() || 'outlook.office365.com';
+    const poolIncludeJunk = String(process.env.POOL_EMAIL_INCLUDE_JUNK || '1') !== '0';
+
+    if (emailSource === 'pool') {
+        const hasOauth = Boolean(poolEmail && poolClientId && poolRefreshToken);
+        const hasPlainPwd = Boolean(poolEmail && poolImapPass);
+        if (!hasOauth && !hasPlainPwd) {
+            throw new Error('邮箱池上下文缺失，无法拉取 OAuth 验证码');
+        }
+
+        const onNoNewCodeFor30Seconds = typeof options.onNoNewCodeFor30Seconds === 'function'
+            ? options.onNoNewCodeFor30Seconds
+            : null;
+        const onBeforePoll = typeof options.onBeforePoll === 'function'
+            ? options.onBeforePoll
+            : null;
+        let lastResendAt = 0;
+
+        for (let i = 0; i < maxRetries; i += 1) {
+            if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
+                console.log(`📨 [MS-IMAP] OAuth 轮询中 ${i + 1}/${maxRetries}...`);
+            }
+
+            if (onBeforePoll) {
+                const recovered = await onBeforePoll(i + 1);
+                if (recovered) {
+                    console.log('📨 [MS-IMAP] 页面已恢复，继续等待新验证码...');
+                }
+            }
+
+            try {
+                const code = await fetchLatestOpenAiOtpOnce({
+                    email: poolEmail || normalizedEmail,
+                    password: poolImapPass,
+                    clientId: poolClientId,
+                    refreshToken: poolRefreshToken,
+                    host: poolImapHost,
+                    includeJunk: poolIncludeJunk,
+                    excludeCode
+                });
+                if (code) {
+                    console.log(`📨 [MS-IMAP] 成功获取验证码: ${code}`);
+                    return code;
+                }
+            } catch (err) {
+                console.warn(`📨 [MS-IMAP] 本次轮询失败: ${err.message || err}`);
+            }
+
+            if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
+                const now = Date.now();
+                if (now - lastResendAt >= 28000) {
+                    lastResendAt = now;
+                    await onNoNewCodeFor30Seconds();
+                }
+            }
+
+            for (let waitTick = 0; waitTick < 10; waitTick += 1) {
+                if (onBeforePoll) {
+                    const recovered = await onBeforePoll(i + 1);
+                    if (recovered) {
+                        console.log('📨 [MS-IMAP] 页面恢复完成，保持旧验证码排除，继续等待新验证码...');
+                        break;
+                    }
+                }
+                await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+        }
+
+        throw new Error('获取验证码超时');
+    }
+
     if (!inboxJwt || !inboxApiBase) {
         throw new Error('CF Worker 邮箱上下文缺失，无法拉取 OAuth 验证码');
     }
@@ -574,7 +620,7 @@ async function waitForOtpInputReady(page, email, authUrl = '', timeout = 45000) 
 }
 
 async function submitOtpWithRetry(page, email, maxAttempts = MAX_OTP_RETRIES, options = {}) {
-    const normalizedEmail = normalizeCloudEmail(email);
+    const normalizedEmail = String(email || '').trim().toLowerCase();
     let lastCode = '';
     const beforeAttempt = typeof options.beforeAttempt === 'function' ? options.beforeAttempt : null;
 
@@ -693,7 +739,7 @@ async function checkProxyAvailability(proxyUrl) {
 const store = require('./mysql-store');
 
 async function runFullProtocolFlow(email) {
-    email = normalizeCloudEmail(email);
+    email = String(email || '').trim().toLowerCase();
     // 阶段三代理检查（仅取代理，不锁定手机/卡资产）；失败则重新拉取配置并多轮重试
     const maxProxyRounds = 5;
     let proxyValue = '';

@@ -99,7 +99,6 @@
 ### 3) 多渠道邮箱
 - **CF Worker 临时邮箱**（多域名随机选 + 失败黑名单 + `x-admin-auth` 管理接口）
 - **Microsoft Outlook IMAP / XOAUTH2** 邮箱池
-- **OpenAI 自有随机域名** 三选一，可在后台动态切换
 
 ### 4) 智能重试
 | 错误类型 | 处理 |

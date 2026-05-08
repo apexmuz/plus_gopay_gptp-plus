@@ -4,6 +4,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const inboxEmail = require('./inbox-email');
+const { fetchLatestOpenAiOtpOnce } = require('./pool-email-imap');
 const { createRegistrationProfile } = require('./registration-identity');
 const { normalizeExcludedCodes, isCodeExcluded } = require('./otp-code-utils');
 const { detectRegistrationAdvance } = require('./registration-submit-state');
@@ -61,36 +62,7 @@ async function checkProxyAvailability(proxyUrl) {
     }
 }
 
-function getRandomEmailDomain() {
-    return String(process.env.RANDOM_EMAIL_DOMAIN || 'chiyiyi.cloud')
-        .trim()
-        .replace(/^@/, '')
-        .toLowerCase()
-        || 'chiyiyi.cloud';
-}
-
-function escapeRegex(str) {
-    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function normalizeCloudEmail(email) {
-    let normalized = String(email || '').trim().toLowerCase();
-    if (!normalized) {
-        return normalized;
-    }
-
-    const domain = getRandomEmailDomain();
-    const dupRe = new RegExp(`@${escapeRegex(domain)}(?:\\.${escapeRegex(domain.split('.').pop() || '')})+$`, 'i');
-    normalized = normalized.replace(dupRe, `@${domain}`);
-    if (!normalized.includes('@')) {
-        normalized = `${normalized}@${domain}`;
-    }
-
-    return normalized;
-}
-
 async function getLatestCode(email, maxRetries = 24, excludeCode = '', options = {}) {
-    const normalizedEmail = normalizeCloudEmail(email);
     const inboxJwt = String(process.env.INBOX_JWT || '').trim();
     const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
     if (!inboxJwt || !inboxApiBase) {
@@ -99,12 +71,87 @@ async function getLatestCode(email, maxRetries = 24, excludeCode = '', options =
     return inboxEmail.fetchLatestOpenAiOtp({
         baseUrl: inboxApiBase,
         jwt: inboxJwt,
-        address: normalizedEmail,
+        address: String(email || '').trim().toLowerCase(),
         maxRetries,
         excludeCode,
         onNoNewCodeFor30Seconds: options.onNoNewCodeFor30Seconds || null,
         onBeforePoll: options.onBeforePoll || null
     });
+}
+
+async function getLatestCodeMicrosoftImap(email, credentials = {}, opts = {}) {
+    const maxRetries = Math.max(1, Number(opts.maxRetries || 24));
+    const excludeCode = String(opts.excludeCode || '');
+    const host = String(opts.host || 'outlook.office365.com').trim() || 'outlook.office365.com';
+    const includeJunk = opts.includeJunk !== false;
+    const password = String(credentials?.password || '');
+    const clientId = String(credentials?.clientId || '');
+    const refreshToken = String(credentials?.refreshToken || '');
+    const onNoNewCodeFor30Seconds = typeof opts.onNoNewCodeFor30Seconds === 'function'
+        ? opts.onNoNewCodeFor30Seconds
+        : null;
+    const onBeforePoll = typeof opts.onBeforePoll === 'function'
+        ? opts.onBeforePoll
+        : null;
+    let lastResendAt = 0;
+
+    const authMode = refreshToken && clientId ? 'OAuth2' : '密码';
+    console.log(`📨 [MS-IMAP] 正在为 ${email} 通过 ${host} 获取验证码（${authMode}，垃圾箱${includeJunk ? '已包含' : '未包含'}）...`);
+
+    for (let i = 0; i < maxRetries; i++) {
+        if (i === 0 || (i + 1) % 5 === 0 || i + 1 === maxRetries) {
+            console.log(`📨 [MS-IMAP] 轮询中 ${i + 1}/${maxRetries}...`);
+        }
+
+        if (onBeforePoll) {
+            const recovered = await onBeforePoll(i + 1);
+            if (recovered) {
+                console.log('📨 [MS-IMAP] 页面已恢复，继续等待新验证码...');
+            }
+        }
+
+        try {
+            const code = await fetchLatestOpenAiOtpOnce({
+                email,
+                password,
+                clientId,
+                refreshToken,
+                host,
+                includeJunk,
+                excludeCode
+            });
+
+            if (code) {
+                console.log(`📨 [MS-IMAP] 成功获取验证码: ${code}`);
+                return code;
+            }
+
+            console.log('📨 [MS-IMAP] 暂未读取到符合条件的新验证码，继续轮询...');
+        } catch (err) {
+            console.error(`📨 [MS-IMAP] 本次轮询失败: ${err.message}`);
+        }
+
+        if (excludeCode && onNoNewCodeFor30Seconds && (i + 1) % 6 === 0) {
+            const now = Date.now();
+            if (now - lastResendAt >= 28000) {
+                lastResendAt = now;
+                await onNoNewCodeFor30Seconds();
+            }
+        }
+
+        for (let waitTick = 0; waitTick < 10; waitTick += 1) {
+            if (onBeforePoll) {
+                const recovered = await onBeforePoll(i + 1);
+                if (recovered) {
+                    console.log('📨 [MS-IMAP] 页面恢复完成，保持旧验证码排除，继续等待新验证码...');
+                    break;
+                }
+            }
+            await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+    }
+
+    throw new Error('获取验证码超时');
 }
 
 function buildPlaywrightProxy(proxyValue) {
@@ -759,7 +806,7 @@ async function fillProfileFieldsIfPresent(page, opts = {}) {
 }
 
 async function submitOtpWithRetry(page, email, maxAttempts = MAX_OTP_RETRIES, options = {}) {
-    const normalizedEmail = normalizeCloudEmail(email);
+    const normalizedEmail = String(email || '').trim().toLowerCase();
     const customFetchCode = typeof options.fetchCode === 'function' ? options.fetchCode : null;
     const attemptedCodes = new Set();
     const beforeAttempt = typeof options.beforeAttempt === 'function' ? options.beforeAttempt : null;
@@ -898,11 +945,7 @@ async function runRegistrationFlow() {
     const poolImapHost = String(process.env.POOL_EMAIL_IMAP_HOST || 'outlook.office365.com').trim() || 'outlook.office365.com';
     const poolIncludeJunk = String(process.env.POOL_EMAIL_INCLUDE_JUNK || '1') !== '0';
 
-    const configuredEmailSource = String(process.env.EMAIL_SOURCE || 'inbox').toLowerCase();
-    if (configuredEmailSource !== 'inbox') {
-        console.warn(`⚠️  [邮箱] 已忽略 email_source=${configuredEmailSource}，当前版本统一使用 CF Worker 收件`);
-    }
-    const emailSource = 'inbox';
+    const emailSource = String(process.env.EMAIL_SOURCE || 'inbox').toLowerCase();
     const inboxApiBase = String(process.env.INBOX_API_BASE || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '');
     const inboxAdminPassword = String(process.env.INBOX_ADMIN_PASSWORD || '').trim();
     const inboxEmailDomain = String(process.env.INBOX_EMAIL_DOMAIN || '').trim().replace(/^@/, '');
@@ -926,31 +969,40 @@ async function runRegistrationFlow() {
         console.warn(`⚠️  [系统] 无法从后端获取代理配置: ${e.message}`);
     }
 
+    const hasOauth = Boolean(poolEmailId && rawPoolEmail && poolClientId && poolRefreshToken);
+    const hasPlainPwd = Boolean(poolEmailId && rawPoolEmail && poolImapPass);
+    const usePoolImap = (emailSource === 'pool') && (hasOauth || hasPlainPwd);
     const useInbox = emailSource === 'inbox';
     const registrationProfile = __registrationProfile || (__registrationProfile = createRegistrationProfile());
 
     let email = '';
     let inboxJwt = '';
-    if (useInbox) {
+    if (usePoolImap) {
+        email = rawPoolEmail;
+        console.log(`📬 [邮箱池] 使用预留邮箱 ${email}`);
+        console.log(`📡 [邮箱池] 主机 ${poolImapHost}  ·  认证 ${hasOauth ? '🔐 OAuth2' : '🔑 密码'}`);
+    } else {
         // 候选域名按顺序尝试，被服务端拒绝的（HTTP 400 Invalid domain）自动跳过
         // 全部都不行就退到"不指定域名"让 API 用默认值
-        const tryOrder = inboxEmailDomainsList.length > 0
+        const preferredDomain = inboxEmailDomain;
+        const candidateDomains = inboxEmailDomainsList.length > 0
             ? [...inboxEmailDomainsList].sort(() => Math.random() - 0.5)
-            : [inboxEmailDomain];
+            : [preferredDomain];
+        const tryOrder = candidateDomains.filter(Boolean);
         tryOrder.push(''); // 兜底：让 API 自己选
 
         let lastErr = null;
-            let usedDomain = '';
-            for (const tryDomain of tryOrder) {
-                try {
-                    const newInbox = await inboxEmail.createAddress({
-                        baseUrl: inboxApiBase,
-                        adminPassword: inboxAdminPassword,
-                        name: registrationProfile.emailLocalPart,
-                        domain: tryDomain || undefined
-                    });
-                    email = newInbox.address;
-                    inboxJwt = newInbox.jwt;
+        let usedDomain = '';
+        for (const tryDomain of tryOrder) {
+            try {
+                const newInbox = await inboxEmail.createAddress({
+                    baseUrl: inboxApiBase,
+                    adminPassword: inboxAdminPassword,
+                    name: registrationProfile.emailLocalPart,
+                    domain: tryDomain || undefined
+                });
+                email = newInbox.address;
+                inboxJwt = newInbox.jwt;
                 usedDomain = tryDomain || '默认';
                 break;
             } catch (e) {
@@ -973,10 +1025,6 @@ async function runRegistrationFlow() {
             ? `（候选 ${inboxEmailDomainsList.length} 域名 · 本次 @${usedDomain}）`
             : `（@${usedDomain}）`;
         console.log(`📨 [Inbox] 临时邮箱已创建: ${email} ${domainHint}`);
-    } else {
-        const randomDomain = getRandomEmailDomain();
-        email = normalizeCloudEmail(`${registrationProfile.emailLocalPart}@${randomDomain}`);
-        console.log(`🎲 [随机邮箱] 本次使用 ${email}`);
     }
 
     const DEBUG_HEADFUL = process.env.HEADFUL === '1';
@@ -1632,15 +1680,31 @@ async function runRegistrationFlow() {
 
         await findVisibleOtpSelector(page, 30000);
         await sleep(Math.random() * 1500 + 1000);
-        const fetchCodeFn = async (excludeCode, pollOpts) => inboxEmail.fetchLatestOpenAiOtp({
-            baseUrl: inboxApiBase,
-            jwt: inboxJwt,
-            address: email,
-            maxRetries: pollOpts.maxRetries,
-            excludeCode,
-            onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
-            onBeforePoll: pollOpts.onBeforePoll
-        });
+        let fetchCodeFn;
+        if (usePoolImap) {
+            fetchCodeFn = async (excludeCode, pollOpts) => getLatestCodeMicrosoftImap(email, {
+                password: poolImapPass,
+                clientId: poolClientId,
+                refreshToken: poolRefreshToken
+            }, {
+                host: poolImapHost,
+                includeJunk: poolIncludeJunk,
+                maxRetries: pollOpts.maxRetries,
+                excludeCode,
+                onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
+                onBeforePoll: pollOpts.onBeforePoll
+            });
+        } else {
+            fetchCodeFn = async (excludeCode, pollOpts) => inboxEmail.fetchLatestOpenAiOtp({
+                baseUrl: inboxApiBase,
+                jwt: inboxJwt,
+                address: email,
+                maxRetries: pollOpts.maxRetries,
+                excludeCode,
+                onNoNewCodeFor30Seconds: pollOpts.onNoNewCodeFor30Seconds,
+                onBeforePoll: pollOpts.onBeforePoll
+            });
+        }
 
         await submitOtpWithRetry(page, email, MAX_OTP_RETRIES, {
             fetchCode: fetchCodeFn,

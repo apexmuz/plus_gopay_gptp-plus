@@ -167,8 +167,7 @@
             if (!key) {
                 return '';
             }
-            const href = `https://imap.chiyiyi.cloud/?key=${encodeURIComponent(key)}`;
-            return `<a href="${href}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-family: monospace; text-decoration: none;">${key}</a>`;
+            return `<code style="color: var(--accent); font-family: monospace;">${key}</code>`;
         }
 
         function decodeJwtPart(part) {

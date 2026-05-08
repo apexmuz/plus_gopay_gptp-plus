@@ -128,7 +128,6 @@ async function initializeBaseData() {
             'pool_email_enabled', '0',
             'pool_email_imap_host', 'outlook.office365.com',
             'pool_email_include_junk', '1',
-            'random_email_domain', 'chiyiyi.cloud',
             'email_source', 'inbox',
             'inbox_api_base', 'https://temp-email-api.jzqkwl.com',
             'inbox_admin_password', '',
@@ -327,7 +326,7 @@ async function getAdminData() {
         runQuery(
             `SELECT config_key, config_value
              FROM app_config
-             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             WHERE config_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 'proxy',
                 'max_concurrent_activations',
@@ -337,7 +336,6 @@ async function getAdminData() {
                 'pool_email_enabled',
                 'pool_email_imap_host',
                 'pool_email_include_junk',
-                'random_email_domain',
                 'email_source',
                 'inbox_api_base',
                 'inbox_admin_password',
@@ -402,13 +400,12 @@ async function getAdminData() {
             max_background_concurrent: Math.max(1, Number(configMap.max_background_concurrent || 1)),
             maintenance_mode: String(configMap.maintenance_mode || '0') === '1',
             maintenance_mode_drain: String(configMap.maintenance_mode_drain || '0') === '1',
-            email_source: ['random', 'pool', 'inbox'].includes(String(configMap.email_source || ''))
+            email_source: ['pool', 'inbox'].includes(String(configMap.email_source || ''))
                 ? String(configMap.email_source)
                 : 'inbox',
             pool_email_enabled: String(configMap.pool_email_enabled || '0') === '1',
             pool_email_imap_host: String(configMap.pool_email_imap_host || 'outlook.office365.com').trim() || 'outlook.office365.com',
             pool_email_include_junk: String(configMap.pool_email_include_junk || '1') === '1',
-            random_email_domain: String(configMap.random_email_domain || 'chiyiyi.cloud').trim().replace(/^@/, '') || 'chiyiyi.cloud',
             inbox_api_base: String(configMap.inbox_api_base || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
             inbox_admin_password: String(configMap.inbox_admin_password || '').trim(),
             inbox_email_domain: String(configMap.inbox_email_domain || '').trim().replace(/^@/, ''),
@@ -477,7 +474,7 @@ async function saveConfig(config) {
     const maxBackgroundConcurrent = Math.max(1, Number(config?.max_background_concurrent || 1));
     const maintenanceMode = config?.maintenance_mode ? '1' : '0';
     const maintenanceModeDrain = config?.maintenance_mode_drain ? '1' : '0';
-    const emailSource = ['random', 'pool', 'inbox'].includes(String(config?.email_source))
+    const emailSource = ['pool', 'inbox'].includes(String(config?.email_source))
         ? String(config.email_source)
         : 'inbox';
     // 兼容旧字段：email_source 是真相，pool_email_enabled 由它派生
@@ -486,11 +483,6 @@ async function saveConfig(config) {
     const poolEmailIncludeJunk = config?.pool_email_include_junk === false || String(config?.pool_email_include_junk || '1') === '0'
         ? '0'
         : '1';
-    const randomEmailDomain = String(config?.random_email_domain || 'chiyiyi.cloud')
-        .trim()
-        .replace(/^@/, '')
-        .toLowerCase()
-        || 'chiyiyi.cloud';
     const inboxApiBase = String(config?.inbox_api_base || 'https://temp-email-api.jzqkwl.com')
         .trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com';
     const inboxAdminPassword = String(config?.inbox_admin_password || '').trim();
@@ -513,7 +505,7 @@ async function saveConfig(config) {
     await withTransaction(async (connection) => {
         await runExecute(
             `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
+             VALUES (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?), (?, ?)
              ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
             [
                 'proxy', proxy,
@@ -524,7 +516,6 @@ async function saveConfig(config) {
                 'pool_email_enabled', poolEmailEnabled,
                 'pool_email_imap_host', poolEmailImapHost,
                 'pool_email_include_junk', poolEmailIncludeJunk,
-                'random_email_domain', randomEmailDomain,
                 'email_source', emailSource,
                 'inbox_api_base', inboxApiBase,
                 'inbox_admin_password', inboxAdminPassword,

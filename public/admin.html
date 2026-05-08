@@ -387,7 +387,6 @@
         }
 
         #pool_email_options[data-disabled="1"],
-        #random_email_options[data-disabled="1"],
         #inbox_email_options[data-disabled="1"] {
             opacity: 0.45;
             pointer-events: none;
@@ -1841,18 +1840,6 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
 
                     <div class="email-source-options" style="margin-top: 18px;">
                         <label class="email-source-card">
-                            <input type="radio" name="email_source" id="email_source_random" value="random">
-                            <div class="email-source-body">
-                                <div class="email-source-title">
-                                    <i data-lucide="shuffle"></i>
-                                    <span>自定义随机邮箱</span>
-                                </div>
-                                <div class="email-source-desc">
-                                    使用下方域名随机生成邮箱地址，验证码通过中转 API 拉取（与该域名同侧的 IMAP 网关）。
-                                </div>
-                            </div>
-                        </label>
-                        <label class="email-source-card">
                             <input type="radio" name="email_source" id="email_source_pool" value="pool">
                             <div class="email-source-body">
                                 <div class="email-source-title">
@@ -1876,19 +1863,6 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                                 </div>
                             </div>
                         </label>
-                    </div>
-
-                    <div id="random_email_options" style="margin-top: 18px;">
-                        <div class="form-group">
-                            <label>随机邮箱域名</label>
-                            <div style="display: flex; align-items: center; gap: 6px;">
-                                <span style="color: var(--text-dim); font-size: 14px;">@</span>
-                                <input type="text" id="random_email_domain" class="asset-input" placeholder="chiyiyi.cloud" style="flex: 1;">
-                            </div>
-                            <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;">
-                                例如：<code>chiyiyi.cloud</code>、<code>example.com</code>。<strong>仅域名部分</strong>，不要带 <code>@</code>，保存后立即生效。
-                            </p>
-                        </div>
                     </div>
 
                     <div id="inbox_email_options" style="margin-top: 18px;" data-disabled="1">
@@ -3786,14 +3760,12 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 lastMaintenanceModeValue = Boolean(data.config.maintenance_mode);
                 updateMaintenanceModeUI(data.config, window.__adminRuntime);
 
-                const src = ['random', 'pool', 'inbox'].includes(String(data.config.email_source))
+                const src = ['pool', 'inbox'].includes(String(data.config.email_source))
                     ? String(data.config.email_source)
-                    : (data.config.pool_email_enabled ? 'pool' : 'random');
-                const radioRandom = document.getElementById('email_source_random');
+                    : (data.config.pool_email_enabled ? 'pool' : 'inbox');
                 const radioPool = document.getElementById('email_source_pool');
                 const radioInbox = document.getElementById('email_source_inbox');
-                if (radioRandom && radioPool && radioInbox) {
-                    radioRandom.checked = src === 'random';
+                if (radioPool && radioInbox) {
                     radioPool.checked = src === 'pool';
                     radioInbox.checked = src === 'inbox';
                     syncEmailSourceUI();
@@ -3805,10 +3777,6 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 const poolEmailJunkEl = document.getElementById('pool_email_include_junk');
                 if (poolEmailJunkEl) {
                     poolEmailJunkEl.checked = data.config.pool_email_include_junk !== false;
-                }
-                const randomDomainEl = document.getElementById('random_email_domain');
-                if (randomDomainEl) {
-                    randomDomainEl.value = data.config.random_email_domain || 'chiyiyi.cloud';
                 }
                 const inboxBaseEl = document.getElementById('inbox_api_base');
                 if (inboxBaseEl) {
@@ -3946,8 +3914,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
 
         function getCurrentEmailSource() {
             if (document.getElementById('email_source_pool')?.checked) return 'pool';
-            if (document.getElementById('email_source_inbox')?.checked) return 'inbox';
-            return 'random';
+            return 'inbox';
         }
 
         function syncEmailSourceUI() {
@@ -3962,18 +3929,8 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 const el = document.getElementById(id);
                 if (el) el.dataset.disabled = enabled ? '0' : '1';
             };
-            setEnabled('random_email_options', src === 'random');
             setEnabled('pool_email_options', src === 'pool');
             setEnabled('inbox_email_options', src === 'inbox');
-        }
-
-        function normalizeRandomDomain(raw) {
-            const cleaned = String(raw || '')
-                .trim()
-                .replace(/^@+/, '')
-                .replace(/\s+/g, '')
-                .toLowerCase();
-            return cleaned || 'chiyiyi.cloud';
         }
 
         function buildConfigPayload(overrides = {}) {
@@ -3989,7 +3946,6 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 pool_email_enabled: src === 'pool',
                 pool_email_imap_host: String(document.getElementById('pool_email_imap_host')?.value || 'outlook.office365.com').trim() || 'outlook.office365.com',
                 pool_email_include_junk: Boolean(document.getElementById('pool_email_include_junk')?.checked),
-                random_email_domain: normalizeRandomDomain(document.getElementById('random_email_domain')?.value),
                 inbox_api_base: String(document.getElementById('inbox_api_base')?.value || 'https://temp-email-api.jzqkwl.com').trim().replace(/\/+$/, '') || 'https://temp-email-api.jzqkwl.com',
                 inbox_admin_password: String(document.getElementById('inbox_admin_password')?.value || '').trim(),
                 inbox_email_domain: String(document.getElementById('inbox_email_domain')?.value || '').trim().replace(/^@/, ''),
@@ -4592,7 +4548,7 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                     <td>${p.claimed_cdk ? `<code>${p.claimed_cdk}</code>` : '<span style="color: var(--text-dim);">-</span>'}</td>
                     <td>
                         ${p.imap_key
-                            ? `<a href="https://imap.chiyiyi.cloud/?key=${encodeURIComponent(p.imap_key)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-family: monospace;">${p.imap_key}</a>`
+                            ? `<code style="font-size:12px;">${escapeHtml(p.imap_key)}</code>`
                             : '<span style="color: var(--text-dim);">-</span>'}
                     </td>
                     <td>${p.time}</td>
