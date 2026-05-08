@@ -1089,6 +1089,145 @@ async function deletePoolEmail(id) {
     await runExecute(`DELETE FROM pool_emails WHERE id = ?`, [Number(id)]);
 }
 
+function parseChatgptAccountPayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+        throw new Error('JSON 不是对象');
+    }
+    const email = payload.user && payload.user.email
+        ? String(payload.user.email).trim().toLowerCase()
+        : (payload.email ? String(payload.email).trim().toLowerCase() : '');
+    if (!email) throw new Error('JSON 缺少 user.email');
+    const accessToken = payload.accessToken ? String(payload.accessToken) : '';
+    if (!accessToken) throw new Error('JSON 缺少 accessToken');
+    const sessionToken = payload.sessionToken ? String(payload.sessionToken) : '';
+    let expiresAt = null;
+    if (payload.expires) {
+        const d = new Date(payload.expires);
+        if (!Number.isNaN(d.getTime())) expiresAt = d;
+    }
+    return { email, accessToken, sessionToken, expiresAt };
+}
+
+function toMysqlDateTime(value) {
+    if (!value) return null;
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+async function importChatgptAccountFromJson(payload) {
+    const parsed = parseChatgptAccountPayload(payload);
+    const expiresAt = toMysqlDateTime(parsed.expiresAt);
+    await runExecute(
+        `INSERT INTO chatgpt_accounts (email, access_token, session_token, access_token_expires_at)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            access_token = VALUES(access_token),
+            session_token = CASE WHEN VALUES(session_token) IS NOT NULL AND VALUES(session_token) <> ''
+                                 THEN VALUES(session_token)
+                                 ELSE chatgpt_accounts.session_token END,
+            access_token_expires_at = VALUES(access_token_expires_at)`,
+        [parsed.email, parsed.accessToken, parsed.sessionToken || null, expiresAt]
+    );
+    const rows = await runQuery(
+        `SELECT id, email FROM chatgpt_accounts WHERE email = ? LIMIT 1`,
+        [parsed.email]
+    );
+    return rows[0] ? { id: rows[0].id, email: rows[0].email } : null;
+}
+
+async function listChatgptAccounts() {
+    const rows = await runQuery(
+        `SELECT id, email,
+                CASE WHEN access_token IS NOT NULL AND LENGTH(TRIM(access_token)) > 0 THEN 1 ELSE 0 END AS has_access,
+                CASE WHEN session_token IS NOT NULL AND LENGTH(TRIM(session_token)) > 0 THEN 1 ELSE 0 END AS has_session,
+                access_token_expires_at,
+                has_free_trial, free_trial_checked_at,
+                availability, availability_checked_at,
+                last_error, registered_at, created_at
+         FROM chatgpt_accounts
+         ORDER BY registered_at DESC, id DESC`
+    );
+    return rows.map((row) => ({
+        id: row.id,
+        email: row.email,
+        has_access: Number(row.has_access || 0) === 1,
+        has_session: Number(row.has_session || 0) === 1,
+        access_token_expires_at: row.access_token_expires_at,
+        has_free_trial: Number(row.has_free_trial || 0) === 1,
+        free_trial_checked_at: row.free_trial_checked_at,
+        availability: row.availability || 'unknown',
+        availability_checked_at: row.availability_checked_at,
+        last_error: row.last_error || '',
+        registered_at: row.registered_at,
+        created_at: row.created_at
+    }));
+}
+
+async function getChatgptAccount(id) {
+    const rows = await runQuery(
+        `SELECT id, email, access_token, session_token, access_token_expires_at,
+                has_free_trial, free_trial_checked_at, availability, availability_checked_at, last_error
+         FROM chatgpt_accounts
+         WHERE id = ?
+         LIMIT 1`,
+        [Number(id)]
+    );
+    return rows[0] || null;
+}
+
+async function updateChatgptAccountStatus(id, { hasFreeTrial, availability, lastError } = {}) {
+    const sets = [];
+    const params = [];
+    if (typeof hasFreeTrial === 'boolean') {
+        sets.push(`has_free_trial = ?`);
+        params.push(hasFreeTrial ? 1 : 0);
+        sets.push(`free_trial_checked_at = CURRENT_TIMESTAMP`);
+    }
+    if (typeof availability === 'string' && availability) {
+        sets.push(`availability = ?`);
+        params.push(availability);
+        sets.push(`availability_checked_at = CURRENT_TIMESTAMP`);
+    }
+    if (lastError !== undefined) {
+        sets.push(`last_error = ?`);
+        params.push(lastError ? String(lastError).slice(0, 1000) : null);
+    }
+    if (!sets.length) return;
+    params.push(Number(id));
+    await runExecute(
+        `UPDATE chatgpt_accounts SET ${sets.join(', ')} WHERE id = ?`,
+        params
+    );
+}
+
+async function updateChatgptAccountTokens(id, { accessToken, expiresAt, email } = {}) {
+    const sets = [];
+    const params = [];
+    if (typeof accessToken === 'string' && accessToken) {
+        sets.push(`access_token = ?`);
+        params.push(accessToken);
+    }
+    if (expiresAt !== undefined) {
+        sets.push(`access_token_expires_at = ?`);
+        params.push(toMysqlDateTime(expiresAt));
+    }
+    if (typeof email === 'string' && email) {
+        sets.push(`email = ?`);
+        params.push(email);
+    }
+    if (!sets.length) return;
+    params.push(Number(id));
+    await runExecute(
+        `UPDATE chatgpt_accounts SET ${sets.join(', ')} WHERE id = ?`,
+        params
+    );
+}
+
+async function deleteChatgptAccount(id) {
+    await runExecute(`DELETE FROM chatgpt_accounts WHERE id = ?`, [Number(id)]);
+}
+
 async function reservePoolEmail(ownerKey = '') {
     return withTransaction(async (connection) => {
         const staleThreshold = new Date(Date.now() - ASSET_LOCK_STALE_MS);
@@ -1714,6 +1853,12 @@ module.exports = {
     listPoolEmails,
     getPoolEmailCredentials,
     deletePoolEmail,
+    importChatgptAccountFromJson,
+    listChatgptAccounts,
+    getChatgptAccount,
+    updateChatgptAccountStatus,
+    updateChatgptAccountTokens,
+    deleteChatgptAccount,
     reservePoolEmail,
     releasePoolEmailReservation,
     markPoolEmailRegistered,

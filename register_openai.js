@@ -1812,11 +1812,34 @@ async function runRegistrationFlow() {
             }
         }
 
+        // 注册成功后立即把账号写入 chatgpt_accounts 台账（即使后续激活失败也保留）
+        let capturedSessionToken = '';
+        try {
+            const cookies = await context.cookies(['https://chatgpt.com', 'https://chat.openai.com']);
+            const cookie = cookies.find((c) => c && c.name === '__Secure-next-auth.session-token');
+            if (cookie && cookie.value) capturedSessionToken = String(cookie.value);
+        } catch (cookieErr) {
+            console.warn(`[账号管理] 读取 session-token cookie 失败: ${cookieErr.message}`);
+        }
+        try {
+            await store.importChatgptAccountFromJson({
+                user: { email },
+                accessToken: sessionData.accessToken,
+                sessionToken: capturedSessionToken || undefined,
+                expires: sessionData.expires || null
+            });
+            console.log(`[账号管理] 已记录新账号 email=${email}${capturedSessionToken ? ' (含 sessionToken)' : ' (无 sessionToken)'}`);
+        } catch (recordErr) {
+            console.warn(`[账号管理] 写入账号台账失败: ${recordErr.message}`);
+        }
+
         await browser.close();
         // 把邮箱来源/JWT/API base 一起回传，让 oauth_login 用同一个邮箱后端拿验证码
         return {
             email,
             accessToken: sessionData.accessToken,
+            sessionToken: capturedSessionToken || '',
+            expires: sessionData.expires || null,
             emailSource,
             inboxJwt: inboxJwt || '',
             inboxApiBase: useInbox ? inboxApiBase : ''

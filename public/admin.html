@@ -1570,6 +1570,10 @@
                 <i data-lucide="package"></i>
                 <span>成品号池</span>
             </div>
+            <div class="nav-item" onclick="switchPage('chatgpt_accounts', this)">
+                <i data-lucide="user-check"></i>
+                <span>账号管理</span>
+            </div>
             <div class="nav-item" onclick="switchPage('logs', this)">
                 <i data-lucide="file-text"></i>
                 <span>任务管理</span>
@@ -2394,6 +2398,83 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 <div id="product_pagination" class="table-footer"></div>
             </div>
         </div>
+
+        <!-- 账号管理 -->
+        <div id="chatgpt_accounts" class="page-view">
+            <div class="page-header">
+                <h1>账号管理</h1>
+                <p>记录已注册成功的 ChatGPT 账号；可单独刷新「免费试用」与「账号是否可用」状态，并通过 sessionToken 刷新 AccessToken。</p>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">导入账号（auth/session JSON）</h2>
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <button type="button" class="btn btn-success" onclick="document.getElementById('chatgpt_account_import_text').value=''">
+                            <i data-lucide="eraser"></i>
+                            清空
+                        </button>
+                        <button type="button" class="btn btn-primary" onclick="submitChatgptAccountImport()">
+                            <i data-lucide="upload"></i>
+                            解析并导入
+                        </button>
+                    </div>
+                </div>
+                <div class="form-group" style="margin-top: 16px;">
+                    <label>粘贴单段 JSON</label>
+                    <textarea id="chatgpt_account_import_text" class="asset-input" rows="8"
+                        placeholder='{
+  "user": { "email": "user@example.com", "id": "user-..." },
+  "expires": "2026-06-08T00:00:00.000Z",
+  "accessToken": "eyJhbGciOi...",
+  "sessionToken": "eyJhbGciOi..."
+}'></textarea>
+                    <p style="font-size: 13px; color: var(--text-dim); margin-top: 10px;">
+                        必填字段：<code>user.email</code> + <code>accessToken</code>。<code>sessionToken</code>（即 <code>__Secure-next-auth.session-token</code> cookie 值）可选；<strong>不填则无法使用「刷新 AccessToken」</strong>。重复邮箱将更新 token，保留 <em>注册时间</em>。
+                    </p>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">账号列表</h2>
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <button type="button" class="btn btn-success" onclick="batchRefreshChatgptAccountStatus()">
+                            <i data-lucide="refresh-cw"></i>
+                            批量刷新选中
+                        </button>
+                        <button type="button" class="btn btn-success" onclick="loadChatgptAccounts(true)">
+                            <i data-lucide="rotate-cw"></i>
+                            刷新列表
+                        </button>
+                    </div>
+                </div>
+                <div class="batch-actions" style="margin-top: 16px;">
+                    <button class="btn btn-success" onclick="toggleAllChatgptAccounts()">
+                        <i data-lucide="check-square"></i>
+                        全选/取消
+                    </button>
+                </div>
+                <div class="table-wrapper" style="margin-top: 16px;">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th width="50px" style="text-align:center">选</th>
+                                <th style="min-width:220px;">邮箱</th>
+                                <th width="180px">注册时间</th>
+                                <th width="120px" style="text-align:center">免费试用</th>
+                                <th width="120px" style="text-align:center">账号状态</th>
+                                <th width="200px">最后检查</th>
+                                <th width="320px" style="text-align:center">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="chatgpt_accounts_body"></tbody>
+                    </table>
+                </div>
+                <p id="chatgpt_accounts_empty_hint" style="display:none; margin-top:16px; color: var(--text-dim);">暂无账号，请先粘贴 auth/session JSON 导入。</p>
+            </div>
+        </div>
+
         <div id="logs" class="page-view">
             <div class="page-header">
                 <h1>任务管理</h1>
@@ -3206,6 +3287,9 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
             if (pId === 'pool_emails') {
                 loadPoolEmails(false).catch(() => { });
             }
+            if (pId === 'chatgpt_accounts') {
+                loadChatgptAccounts(false).catch(() => { });
+            }
         }
 
         function escapeHtml(str) {
@@ -3391,6 +3475,237 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                 }
                 showMessage(data.message || '已删除', 'success');
                 await loadPoolEmails(false);
+            } catch (error) {
+                showMessage(error.message || '删除失败', 'error');
+            }
+        }
+
+        // ====== 账号管理（chatgpt_accounts） ======
+        let chatgptAccountsList = [];
+        const chatgptAccountSelected = new Set();
+
+        function fmtDateTime(value) {
+            if (!value) return '—';
+            return String(value).replace('T', ' ').slice(0, 19);
+        }
+
+        function freeTrialBadge(row) {
+            if (!row.free_trial_checked_at) {
+                return '<span class="status-badge" style="opacity:.7;">未检查</span>';
+            }
+            return row.has_free_trial
+                ? '<span class="status-badge status-success">可用</span>'
+                : '<span class="status-badge" style="background:rgba(148,163,184,0.18);color:#64748b;">不可用</span>';
+        }
+
+        function availabilityBadge(row) {
+            const v = String(row.availability || 'unknown');
+            if (!row.availability_checked_at && v === 'unknown') {
+                return '<span class="status-badge" style="opacity:.7;">未检查</span>';
+            }
+            switch (v) {
+                case 'available':
+                    return '<span class="status-badge status-success">正常</span>';
+                case 'banned':
+                    return '<span class="status-badge" style="background:rgba(239,68,68,0.14);color:#ef4444;">已封号</span>';
+                case 'expired_token':
+                    return '<span class="status-badge" style="background:rgba(245,158,11,0.16);color:#d97706;">Token过期</span>';
+                default:
+                    return '<span class="status-badge" style="background:rgba(148,163,184,0.18);color:#64748b;">未知</span>';
+            }
+        }
+
+        function renderChatgptAccountsTable() {
+            const tbody = document.getElementById('chatgpt_accounts_body');
+            const hint = document.getElementById('chatgpt_accounts_empty_hint');
+            if (!tbody) return;
+            if (!chatgptAccountsList.length) {
+                tbody.innerHTML = '';
+                if (hint) hint.style.display = 'block';
+                lucide.createIcons();
+                return;
+            }
+            if (hint) hint.style.display = 'none';
+
+            tbody.innerHTML = chatgptAccountsList.map((row) => {
+                const id = Number(row.id);
+                const checked = chatgptAccountSelected.has(id) ? 'checked' : '';
+                const lastChecked = row.availability_checked_at || row.free_trial_checked_at;
+                const errorTip = row.last_error
+                    ? `<div style="font-size:12px;color:var(--text-dim);margin-top:4px;" title="${escapeHtml(row.last_error)}">${escapeHtml(String(row.last_error).slice(0, 60))}${row.last_error.length > 60 ? '…' : ''}</div>`
+                    : '';
+                const refreshTokenBtn = row.has_session
+                    ? `<button type="button" class="btn btn-success" style="padding:8px 12px;margin-right:6px;border-radius:10px;" onclick="refreshChatgptAccountToken(${id}, this)" title="使用 sessionToken 调用 auth/session 刷新 AccessToken">
+                            <i data-lucide="key-round"></i> 刷新Token
+                       </button>`
+                    : `<button type="button" class="btn btn-success" style="padding:8px 12px;margin-right:6px;border-radius:10px;opacity:.55;cursor:not-allowed;" disabled title="未导入 sessionToken">
+                            <i data-lucide="key-round"></i> 刷新Token
+                       </button>`;
+                return `
+                <tr>
+                    <td style="text-align:center">
+                        <input type="checkbox" ${checked} onchange="toggleChatgptAccountSelection(${id}, this.checked)" />
+                    </td>
+                    <td><code>${escapeHtml(row.email || '')}</code>${errorTip}</td>
+                    <td>${escapeHtml(fmtDateTime(row.registered_at))}</td>
+                    <td style="text-align:center">${freeTrialBadge(row)}</td>
+                    <td style="text-align:center">${availabilityBadge(row)}</td>
+                    <td>${escapeHtml(fmtDateTime(lastChecked))}</td>
+                    <td style="text-align:center; white-space:nowrap;">
+                        <button type="button" class="btn btn-success" style="padding:8px 12px;margin-right:6px;border-radius:10px;" onclick="refreshChatgptAccountStatus(${id}, this)">
+                            <i data-lucide="refresh-cw"></i> 刷新状态
+                        </button>
+                        ${refreshTokenBtn}
+                        <button type="button" class="btn btn-success" style="padding:8px 12px;margin-right:6px;border-radius:10px;" onclick="copyChatgptAccountToken(${id})">
+                            <i data-lucide="copy"></i> 复制Token
+                        </button>
+                        <button type="button" class="btn-delete" onclick="deleteChatgptAccountRow(${id})">
+                            <i data-lucide="trash-2"></i>
+                        </button>
+                    </td>
+                </tr>`;
+            }).join('');
+            lucide.createIcons();
+        }
+
+        function toggleChatgptAccountSelection(id, checked) {
+            const numId = Number(id);
+            if (checked) chatgptAccountSelected.add(numId);
+            else chatgptAccountSelected.delete(numId);
+        }
+
+        function toggleAllChatgptAccounts() {
+            const allSelected = chatgptAccountsList.every((r) => chatgptAccountSelected.has(Number(r.id)));
+            chatgptAccountSelected.clear();
+            if (!allSelected) {
+                chatgptAccountsList.forEach((r) => chatgptAccountSelected.add(Number(r.id)));
+            }
+            renderChatgptAccountsTable();
+        }
+
+        async function loadChatgptAccounts(showToast = false) {
+            try {
+                const res = await authFetch('/api/admin/chatgpt-accounts');
+                const data = await res.json();
+                if (!res.ok || data.success === false) {
+                    throw new Error(data.message || '加载账号列表失败');
+                }
+                chatgptAccountsList = Array.isArray(data.items) ? data.items : [];
+                // 清掉已不存在的选中
+                const validIds = new Set(chatgptAccountsList.map((r) => Number(r.id)));
+                [...chatgptAccountSelected].forEach((id) => { if (!validIds.has(id)) chatgptAccountSelected.delete(id); });
+                renderChatgptAccountsTable();
+                if (showToast) showMessage('账号列表已刷新', 'success');
+            } catch (error) {
+                showMessage(error.message || '加载账号列表失败', 'error');
+            }
+        }
+
+        async function submitChatgptAccountImport() {
+            const ta = document.getElementById('chatgpt_account_import_text');
+            const text = ta ? ta.value.trim() : '';
+            if (!text) { showMessage('请粘贴 auth/session JSON', 'warning'); return; }
+            try {
+                const res = await authFetch('/api/admin/chatgpt-accounts/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ json: text })
+                });
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '导入失败');
+                showMessage(data.message || '导入成功', 'success');
+                ta.value = '';
+                await loadChatgptAccounts(false);
+            } catch (error) {
+                showMessage(error.message || '导入失败', 'error');
+            }
+        }
+
+        async function refreshChatgptAccountStatus(id, btn) {
+            const original = btn ? btn.innerHTML : '';
+            try {
+                if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader"></i> 检查中...'; lucide.createIcons(); }
+                const res = await authFetch(`/api/admin/chatgpt-accounts/${id}/refresh-status`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '刷新失败');
+                showMessage('已更新状态', 'success');
+                await loadChatgptAccounts(false);
+            } catch (error) {
+                showMessage(error.message || '刷新失败', 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.innerHTML = original; lucide.createIcons(); }
+            }
+        }
+
+        async function batchRefreshChatgptAccountStatus() {
+            const ids = [...chatgptAccountSelected];
+            if (!ids.length) { showMessage('请先勾选要刷新的账号', 'warning'); return; }
+            try {
+                showMessage(`开始批量刷新 ${ids.length} 个账号...`, 'success');
+                const res = await authFetch('/api/admin/chatgpt-accounts/refresh-status-batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids })
+                });
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '批量刷新失败');
+                const okCount = (data.results || []).filter((r) => r.ok).length;
+                showMessage(`批量刷新完成：${okCount}/${ids.length} 成功`, okCount === ids.length ? 'success' : 'warning');
+                await loadChatgptAccounts(false);
+            } catch (error) {
+                showMessage(error.message || '批量刷新失败', 'error');
+            }
+        }
+
+        async function refreshChatgptAccountToken(id, btn) {
+            const original = btn ? btn.innerHTML : '';
+            try {
+                if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader"></i> 刷新中...'; lucide.createIcons(); }
+                const res = await authFetch(`/api/admin/chatgpt-accounts/${id}/refresh-token`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '刷新 Token 失败');
+                showMessage(data.message || 'AccessToken 已刷新', 'success');
+                await loadChatgptAccounts(false);
+            } catch (error) {
+                showMessage(error.message || '刷新 Token 失败', 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.innerHTML = original; lucide.createIcons(); }
+            }
+        }
+
+        async function copyChatgptAccountToken(id) {
+            try {
+                const res = await authFetch(`/api/admin/chatgpt-accounts/${id}/access-token`);
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '获取 Token 失败');
+                const token = String(data.access_token || '');
+                if (!token) throw new Error('该账号无 accessToken');
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(token);
+                } else {
+                    const ta = document.createElement('textarea');
+                    ta.value = token;
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
+                showMessage('AccessToken 已复制到剪贴板', 'success');
+            } catch (error) {
+                showMessage(error.message || '复制失败', 'error');
+            }
+        }
+
+        async function deleteChatgptAccountRow(id) {
+            const ok = await showAdminConfirm(`确定删除 ChatGPT 账号 #${id} ?`, '删除账号');
+            if (!ok) return;
+            try {
+                const res = await authFetch(`/api/admin/chatgpt-accounts/${id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!res.ok || data.success === false) throw new Error(data.message || '删除失败');
+                chatgptAccountSelected.delete(Number(id));
+                showMessage(data.message || '已删除', 'success');
+                await loadChatgptAccounts(false);
             } catch (error) {
                 showMessage(error.message || '删除失败', 'error');
             }

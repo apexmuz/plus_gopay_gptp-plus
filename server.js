@@ -1735,6 +1735,142 @@ app.get('/api/admin/pool-emails/:id/messages', authenticateAdmin, async (req, re
     }
 });
 
+/** ChatGPT 账号台账（账号管理菜单） */
+const chatgptAccountChecker = require('./chatgpt-account-checker');
+
+async function refreshChatgptAccountStatus(account) {
+    const id = Number(account.id);
+    let availability = 'unknown';
+    let availabilityError = '';
+    let hasFreeTrial = false;
+    let trialError = '';
+
+    const availResult = await chatgptAccountChecker.checkAvailability(account.access_token);
+    availability = availResult.availability || 'unknown';
+    if (availResult.error) availabilityError = availResult.error;
+
+    if (availability === 'available' || availability === 'unknown') {
+        const trial = await chatgptAccountChecker.checkFreeTrial(account.access_token);
+        hasFreeTrial = !!trial.hasFreeTrial;
+        if (trial.error) trialError = trial.error;
+        if (trial.statusHint && availability === 'unknown') {
+            availability = trial.statusHint;
+        }
+    }
+
+    const lastError = [availabilityError, trialError].filter(Boolean).join(' | ');
+    await store.updateChatgptAccountStatus(id, {
+        availability,
+        hasFreeTrial,
+        lastError: lastError || null
+    });
+    return { id, availability, hasFreeTrial, error: lastError };
+}
+
+app.get('/api/admin/chatgpt-accounts', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const items = await store.listChatgptAccounts();
+        res.json({ success: true, items });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/chatgpt-accounts/import', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const raw = String(req.body?.json ?? '').trim();
+        if (!raw) return res.status(400).json({ success: false, message: '请粘贴 auth/session JSON' });
+        let payload;
+        try { payload = JSON.parse(raw); }
+        catch (e) { return res.status(400).json({ success: false, message: 'JSON 解析失败：' + e.message }); }
+        const row = await store.importChatgptAccountFromJson(payload);
+        if (!row) return res.status(500).json({ success: false, message: '导入后未能定位到记录' });
+        res.json({ success: true, message: '账号已导入', item: row });
+    } catch (error) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/chatgpt-accounts/:id/refresh-status', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const account = await store.getChatgptAccount(Number(req.params.id));
+        if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+        const result = await refreshChatgptAccountStatus(account);
+        res.json({ success: true, result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/chatgpt-accounts/refresh-status-batch', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
+        if (!ids.length) return res.status(400).json({ success: false, message: '未选择账号' });
+        const results = [];
+        for (const id of ids) {
+            try {
+                const account = await store.getChatgptAccount(id);
+                if (!account) {
+                    results.push({ id, ok: false, error: '账号不存在' });
+                    continue;
+                }
+                const r = await refreshChatgptAccountStatus(account);
+                results.push({ id, ok: true, ...r });
+            } catch (err) {
+                results.push({ id, ok: false, error: err.message });
+            }
+        }
+        res.json({ success: true, results });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/chatgpt-accounts/:id/refresh-token', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const account = await store.getChatgptAccount(Number(req.params.id));
+        if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+        if (!account.session_token) {
+            return res.status(400).json({ success: false, message: '该账号未导入 sessionToken，无法刷新' });
+        }
+        const fresh = await chatgptAccountChecker.refreshAccessTokenViaSession(account.session_token);
+        await store.updateChatgptAccountTokens(Number(req.params.id), {
+            accessToken: fresh.accessToken,
+            expiresAt: fresh.expires
+        });
+        res.json({ success: true, message: 'AccessToken 已刷新', expires: fresh.expires });
+    } catch (error) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+
+app.get('/api/admin/chatgpt-accounts/:id/access-token', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const account = await store.getChatgptAccount(Number(req.params.id));
+        if (!account) return res.status(404).json({ success: false, message: '账号不存在' });
+        if (!account.access_token) return res.status(400).json({ success: false, message: '该账号无 accessToken' });
+        res.json({ success: true, access_token: account.access_token });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.delete('/api/admin/chatgpt-accounts/:id', authenticateAdmin, async (req, res) => {
+    try {
+        await ensureStoreReady();
+        await store.deleteChatgptAccount(Number(req.params.id));
+        res.json({ success: true, message: '账号已删除' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 app.use('/api/admin', authenticateAdmin);
 
 app.get('/api/public/runtime', async (req, res) => {

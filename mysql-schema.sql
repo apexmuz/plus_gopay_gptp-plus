@@ -120,3 +120,20 @@ CREATE TABLE IF NOT EXISTS pool_emails (
     UNIQUE KEY uniq_pool_emails_email (email),
     KEY idx_pool_emails_pick (registered, is_active, in_use, locked_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS chatgpt_accounts (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    access_token TEXT NULL,
+    session_token TEXT NULL,
+    access_token_expires_at TIMESTAMP NULL DEFAULT NULL,
+    has_free_trial TINYINT(1) NOT NULL DEFAULT 0,
+    free_trial_checked_at TIMESTAMP NULL DEFAULT NULL,
+    availability VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    availability_checked_at TIMESTAMP NULL DEFAULT NULL,
+    last_error TEXT NULL,
+    registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_chatgpt_accounts_email (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
