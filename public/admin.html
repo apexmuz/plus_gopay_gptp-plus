@@ -49,6 +49,8 @@
             --warning-soft: #fffbeb;
             --info: #0ea5e9;
             --info-soft: #f0f9ff;
+            --control-height-md: 40px;
+            --control-height-sm: 34px;
 
             /* 阴影 */
             --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
@@ -616,6 +618,58 @@
             height: 14px;
         }
 
+        .form-header-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+
+        .toolbar-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .toolbar-actions--end {
+            justify-content: flex-end;
+        }
+
+        .control-md {
+            min-height: var(--control-height-md);
+        }
+
+        .btn.control-md,
+        label.control-md,
+        .filter-trigger.control-md {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        input.asset-input.control-md,
+        select.asset-input.control-md {
+            min-height: var(--control-height-md);
+            padding-top: 9px;
+            padding-bottom: 9px;
+        }
+
+        .filter-trigger.control-md {
+            min-height: var(--control-height-md);
+            padding-top: 9px;
+            padding-bottom: 9px;
+        }
+
+        .btn-compact {
+            min-height: var(--control-height-sm) !important;
+            padding: 7px 14px !important;
+            border-radius: 8px !important;
+            font-size: 12px !important;
+        }
+
         /* 批量导入框 */
         .import-box {
             display: none;
@@ -919,6 +973,22 @@
             padding: 7px 14px;
             border-radius: 8px;
             font-size: 12px;
+        }
+
+        .table-action-group {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .table-action-group .btn,
+        .table-action-group .btn-delete {
+            flex-shrink: 0;
+        }
+
+        .task-log-stop-btn {
+            margin-right: 0 !important;
         }
 
         /* 自定义下拉过滤器 */
@@ -1772,9 +1842,9 @@
                 <div class="panel">
                     <h2 class="panel-title">网络与并发</h2>
                     <div class="form-group" style="margin-top: 24px;">
-                        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+                        <div class="form-header-row">
                             <label style="margin: 0;">代理服务器地址（PROXY URL）</label>
-                            <button type="button" class="btn btn-success" style="padding:6px 12px; font-size:13px;" onclick="batchTestProxies()">
+                            <button type="button" class="btn btn-success control-md" onclick="batchTestProxies()">
                                 <i data-lucide="zap"></i>
                                 批量测试
                             </button>
@@ -2123,18 +2193,18 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
             <div class="panel">
                 <div class="panel-header">
                     <h2 class="panel-title">批量导入</h2>
-                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                        <label class="btn btn-success" style="cursor:pointer;">
+                    <div class="toolbar-actions">
+                        <label class="btn btn-success control-md" style="cursor:pointer;">
                             <i data-lucide="file-up"></i>
                             选择 mail.txt
                             <input type="file" accept=".txt,text/plain" id="pool_mail_file_input" style="display:none"
                                 onchange="handlePoolMailFileImport(event)">
                         </label>
-                        <button type="button" class="btn btn-primary" onclick="submitPoolMailImport()">
+                        <button type="button" class="btn btn-primary control-md" onclick="submitPoolMailImport()">
                             <i data-lucide="upload"></i>
                             导入到数据库
                         </button>
-                        <button type="button" class="btn btn-success" onclick="loadPoolEmails(true)">
+                        <button type="button" class="btn btn-success control-md" onclick="loadPoolEmails(true)">
                             <i data-lucide="refresh-cw"></i>
                             刷新列表
                         </button>
@@ -2200,15 +2270,15 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
             <div class="panel">
                 <div class="panel-header">
                     <h2 class="panel-title">激活码列表</h2>
-                    <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
-                        <button class="btn btn-success" onclick="toggleImportBox('cdk')">
+                    <div class="toolbar-actions toolbar-actions--end">
+                        <button class="btn btn-success control-md" onclick="toggleImportBox('cdk')">
                             <i data-lucide="upload"></i>
                             批量导入
                         </button>
-                        <input type="text" id="cdk_search" class="asset-input" placeholder="搜索激活码 / 卡密"
+                        <input type="text" id="cdk_search" class="asset-input control-md" placeholder="搜索激活码 / 卡密"
                             style="width: 220px;" oninput="handleCdkSearch(this.value)">
                         <div class="filter-dropdown" data-filter="cdk_generate_type" style="min-width: 110px;">
-                            <button class="filter-trigger" onclick="toggleFilterMenu('cdk_generate_type')">
+                            <button class="filter-trigger control-md" onclick="toggleFilterMenu('cdk_generate_type')">
                                 <span id="current_cdk_type_label">自助</span>
                                 <i data-lucide="chevron-down"></i>
                             </button>
@@ -2217,9 +2287,9 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                                 <button class="filter-option" onclick="selectGenerateType('成品')">成品</button>
                             </div>
                         </div>
-                        <input type="number" id="cdk_count" value="1" min="1" max="100" class="asset-input"
+                        <input type="number" id="cdk_count" value="1" min="1" max="100" class="asset-input control-md"
                             style="width: 80px;">
-                        <button class="btn btn-primary" onclick="generateCDKs(this)">
+                        <button class="btn btn-primary control-md" onclick="generateCDKs(this)">
                             <i data-lucide="sparkles"></i>
                             生成
                         </button>
@@ -2296,9 +2366,9 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
             <div class="panel">
                 <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
                     <div class="panel-title">账号资源管理</div>
-                    <div class="panel-actions" style="display: flex; gap: 12px; align-items: center;">
-                        <input type="number" id="product_gen_count" value="1" min="1" max="100" class="asset-input" style="width: 80px;" placeholder="数量">
-                        <button class="btn btn-primary" onclick="startProductGeneration(this)">
+                    <div class="panel-actions toolbar-actions">
+                        <input type="number" id="product_gen_count" value="1" min="1" max="100" class="asset-input control-md" style="width: 80px;" placeholder="数量">
+                        <button class="btn btn-primary control-md" onclick="startProductGeneration(this)">
                             <i data-lucide="play"></i>
                             开始生产
                         </button>
@@ -2506,10 +2576,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                         <input type="checkbox" id="runtime_log_pause">
                         <span>暂停拉取</span>
                     </label>
-                    <button type="button" class="btn btn-primary" id="runtime_log_refresh_btn" onclick="refreshRuntimeLogsManual()">
+                    <button type="button" class="btn btn-primary btn-compact" id="runtime_log_refresh_btn" onclick="refreshRuntimeLogsManual()">
                         <i data-lucide="refresh-cw"></i> 立即刷新
                     </button>
-                    <button type="button" class="btn btn-delete" id="runtime_log_clear_btn" onclick="clearRuntimeLogs()">
+                    <button type="button" class="btn btn-delete btn-compact" id="runtime_log_clear_btn" onclick="clearRuntimeLogs()">
                         <i data-lucide="trash-2"></i> 清空日志
                     </button>
                 </div>
@@ -4154,8 +4224,10 @@ http://USER-session-{session}:PASS@your-proxy.example.com:1000"></textarea>
                     </td>
                     <td>${renderStatus(l.status)}</td>
                     <td style="text-align:center">
-                        ${l.status === 'running' ? `<button type="button" class="btn btn-delete" title="停止此任务" style="padding:8px 10px;margin-right:8px;border-radius:10px;" onclick='stopAdminTask(${JSON.stringify(l.id)})'><i data-lucide="square"></i></button>` : ''}
-                        <button type="button" class="btn-delete" title="删除此任务记录" onclick='deleteAdminTaskLog(${JSON.stringify(l.id)})'><i data-lucide="trash-2"></i></button>
+                        <div class="table-action-group">
+                            ${l.status === 'running' ? `<button type="button" class="btn btn-delete task-log-stop-btn" title="停止此任务" style="padding:8px 10px;border-radius:10px;" onclick='stopAdminTask(${JSON.stringify(l.id)})'><i data-lucide="square"></i></button>` : ''}
+                            <button type="button" class="btn-delete" title="删除此任务记录" onclick='deleteAdminTaskLog(${JSON.stringify(l.id)})'><i data-lucide="trash-2"></i></button>
+                        </div>
                     </td>
                 </tr>
             `).join('');
