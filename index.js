@@ -643,17 +643,23 @@ async function run() {
                 "iframe[src*='turnstile']",
                 "iframe[src*='recaptcha']"
             ];
+            // ⚠️ hCaptcha 复选框只可能出现在 hcaptcha / turnstile / recaptcha 等
+            // challenge iframe 内，主页面上的 [aria-checked] 通常是 Stripe 的支付方式
+            // 单选（Card / PayPal），误判会让脚本「点」掉用户已选中的支付方式。
             const HCAPTCHA_CHECKBOX_SELECTORS = [
                 "#checkbox",
                 "#checkbox-label",
                 "[id='checkbox']",
                 "[for='checkbox']",
-                "[role='checkbox']",
-                "[aria-checked]",
                 ".check",
-                ".checkbox",
-                "[class*='checkbox']"
+                ".checkbox"
             ];
+            const isChallengeFrame = (frame) => {
+                if (!frame) return false;
+                if (frame === page) return false;
+                const url = String(frame.url() || '');
+                return /hcaptcha|turnstile|recaptcha|captcha|challenge/i.test(url);
+            };
             const SLIDER_SELECTORS = [
                 "#captcha__frame__bottom .slider",
                 "#captcha__frame__bottom .sliderIcon",
@@ -680,10 +686,11 @@ async function run() {
 
             const collectFrames = () => [page, ...page.frames()];
 
-            const tryFindFirstVisible = async (selectors) => {
+            const tryFindFirstVisible = async (selectors, { challengeFramesOnly = false } = {}) => {
                 const deadline = Date.now() + SOFT_WAIT_MS;
                 while (Date.now() < deadline) {
                     for (const frame of collectFrames()) {
+                        if (challengeFramesOnly && !isChallengeFrame(frame)) continue;
                         for (const sel of selectors) {
                             try {
                                 const loc = frame.locator(sel).first();
@@ -718,9 +725,10 @@ async function run() {
                     }
                 }
 
-                const checkboxHit = await tryFindFirstVisible(HCAPTCHA_CHECKBOX_SELECTORS);
+                // hCaptcha 复选框：仅在挑战 iframe 内查找，避免把 Stripe 的 PayPal/Card 单选当作复选框去点
+                const checkboxHit = await tryFindFirstVisible(HCAPTCHA_CHECKBOX_SELECTORS, { challengeFramesOnly: true });
                 if (checkboxHit) {
-                    console.log(`🧩 [风控] 检测到 hCaptcha 复选框: ${checkboxHit.selector}`);
+                    console.log(`🧩 [风控] 检测到 hCaptcha 复选框: ${checkboxHit.selector} (frame=${checkboxHit.frame.url?.() || 'iframe'})`);
                     try {
                         const box = await checkboxHit.locator.boundingBox();
                         if (box) {
@@ -1146,42 +1154,86 @@ async function run() {
         // Phase 3: 直奔核心 - 触发 PayPal 重定向
         // (静默) 直接触发 PayPal 重定向
 
+        // 判定 PayPal 单选是否真的处于"选中态"。Stripe Checkout 的 PayPal 行
+        // 由「外层 div[role=radio] + 内层 input[type=radio]」组成，浏览器自带的
+        // input.checked 才是真值；外层 aria-checked 偶尔滞后一帧。
+        const isPayPalSelectedNow = async () => {
+            return page.evaluate(() => {
+                try {
+                    const inputs = Array.from(document.querySelectorAll('input[type="radio"]'));
+                    const paypalInput = inputs.find((node) => {
+                        const v = String(node.value || '').toLowerCase();
+                        const id = String(node.id || '').toLowerCase();
+                        const name = String(node.name || '').toLowerCase();
+                        return v.includes('paypal') || id.includes('paypal') || name.includes('paypal');
+                    });
+                    if (paypalInput) return !!paypalInput.checked;
+
+                    const ariaRadios = Array.from(document.querySelectorAll('[role="radio"][aria-checked]'));
+                    const paypalRadio = ariaRadios.find((node) => {
+                        const text = (node.innerText || node.textContent || '').toLowerCase();
+                        return text.includes('paypal');
+                    });
+                    if (paypalRadio) return paypalRadio.getAttribute('aria-checked') === 'true';
+                    return null; // 找不到对应控件，无法判定
+                } catch (_) { return null; }
+            }).catch(() => null);
+        };
+
         const triggerPayPal = async () => {
-            const selectors = [
-                '.AccordionItemCover.PaymentMethodFormAccordionItem.paypal-accordion-item-cover',
+            // 优先级最高：直接点 input[type=radio] 关联的 label —— 这是 Stripe 默认结构，
+            // 也是浏览器原生的 checkbox/radio 选中路径，绕过自定义点击体感差异。
+            const candidateSelectors = [
+                'label[for$="paypal"]',
+                'label[for*="paypal" i]',
+                'input[type="radio"][value*="paypal" i]',
                 '[data-testid="paypal-payment-method"]',
-                'button:has-text("PayPal")',
-                'div[role="radio"]:has-text("PayPal")'
+                '.AccordionItemCover.PaymentMethodFormAccordionItem.paypal-accordion-item-cover',
+                'div[role="radio"]:has-text("PayPal")',
+                '.AccordionItem-Header:has-text("PayPal")'
             ];
-            for (const sel of selectors) {
+            for (const sel of candidateSelectors) {
                 const el = page.locator(sel).first();
-                if (await el.isVisible().catch(() => false)) {
-                    // (静默) 命中 PayPal 触发器选择器
-                    await el.click({ force: true });
+                const count = await el.count().catch(() => 0);
+                if (!count) continue;
+                if (!(await el.isVisible().catch(() => false))) continue;
+                try {
+                    await el.click({ force: true, timeout: 3000 });
+                } catch (_) {
+                    continue;
+                }
+                await page.waitForTimeout(500);
+                const selected = await isPayPalSelectedNow();
+                if (selected === true) {
+                    console.log(`✅ [步骤] PayPal 单选已选中（命中选择器：${sel}）`);
                     return true;
                 }
+                if (selected === null) {
+                    // 控件不存在意味着这一版 Stripe Checkout 根本没有 PayPal 选项
+                    console.log("ℹ️ [步骤] 当前 Stripe Checkout 未显示 PayPal 选项，按 Card 流程继续。");
+                    return false;
+                }
+                // selected === false：点了但没选中，换下一个 selector 再试
             }
             return false;
         };
 
-        // 尝试直接点击，如果不成功则刷新一次再点
-        if (!await triggerPayPal()) {
-            console.log("⏳ [步骤] 未能直接触发，正在刷新页面强制加载支付组件...");
-            try {
-                await page.reload({ waitUntil: 'networkidle', timeout: 30000 });
-                await recoverConnectionClosed(page, paypalUrl);
-                if (!await triggerPayPal()) {
-                    // 兜底：尝试直接寻找所有的 PayPal 文字并点击
-                    await page.locator('text=PayPal').first().click({ force: true }).catch(() => { });
-                    await page.waitForTimeout(1500);
-                }
-            } catch (_) {
-                throw new Error("无法获取 PayPal 审批链接");
+        let paypalSelected = false;
+        for (let attempt = 1; attempt <= 3 && !paypalSelected; attempt += 1) {
+            paypalSelected = await triggerPayPal();
+            if (paypalSelected) break;
+            const stillHasPayPal = await page.locator('text=/PayPal/i').first().isVisible().catch(() => false);
+            if (!stillHasPayPal) {
+                // 不再卡在 reload 循环：当前 Stripe Checkout 没给这个号开放 PayPal 入口，
+                // 后续按原 Card 流程兜底（或上层会基于支付失败重试换号）。
+                console.log("ℹ️ [步骤] 页面上没有 PayPal 选项，跳过 PayPal 选中逻辑。");
+                break;
             }
+            console.log(`🔄 [步骤] 第 ${attempt}/3 次未能选中 PayPal，等待页面稳定后重试...`);
+            await page.waitForTimeout(1500);
         }
 
-        // (静默) 已触发 PayPal 流程
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(800);
 
 
         // 通用：等待元素可见，超时则刷新一次再等（避免 Stripe / PayPal 偶发空白）
@@ -1328,6 +1380,21 @@ async function run() {
                     console.log("✅ [地址] 地址补全未出现，已展开手动地址模式。");
                     await manualModeLink.click({ force: true });
                     await page.waitForTimeout(randomDelay(700, 1200));
+                    // Stripe 在切换到手动模式时会替换 #billingAddressLine1 的 DOM 节点，
+                    // 之前在 autocomplete 输入框里键入的值会随之丢失。
+                    // 这里显式回填一次，避免 validateStripeCompleteness 又得紧急补救。
+                    try {
+                        const lineLoc = await pickFirstVisibleStripeInput(['#billingAddressLine1'], 4000);
+                        if (lineLoc) {
+                            const currentVal = await lineLoc.inputValue().catch(() => '');
+                            if (!currentVal || currentVal.trim() !== CONFIG.billing.address.trim()) {
+                                console.log(`📝 [地址] 切换手动模式后街道地址为「${currentVal}」，回填为「${CONFIG.billing.address}」`);
+                                await humanFillInput(page, lineLoc, CONFIG.billing.address, false, true);
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`⚠️ [地址] 切换手动模式后回填街道失败: ${e.message}`);
+                    }
                 } else {
                     // 没有下拉框也没有手动展开入口时，点一下页面顶部安全空白处让地址框失焦
                     const safeX = randomDelay(800, 1100);
@@ -1431,18 +1498,24 @@ async function run() {
             console.log("✅ [步骤] 邮编与城市填写完成。");
             await afterFieldTransition(page, 'zipCity');
         };
-        const fillOrders = [
-            [fillAddress, fillName, fillZipAndCity],
-            [fillName, fillAddress, fillZipAndCity],
-            [fillAddress, fillZipAndCity, fillName],
-        ];
-        const chosenOrder = fillOrders[Math.floor(Math.random() * fillOrders.length)];
-        // (静默) 拟人填写顺序
-        for (const fillFn of chosenOrder) {
-            await fillFn();
-            if (Math.random() < 0.3) {
-                // (静默) 鼠标漫游
-                await continuousHumanRoam(page, randomDelay(1000, 2000));
+        // 仅在 Card 流程下才需要填这些字段。PayPal 选中后，Stripe 会折叠 Card 表单，
+        // 强行去填只会让 #billingAddressLine1 触发 reload，把 PayPal 选中态又冲掉。
+        if (paypalSelected) {
+            console.log("⏩ [步骤] PayPal 已选中，跳过 Stripe Card 表单（姓名/地址/邮编）填写。");
+        } else {
+            const fillOrders = [
+                [fillAddress, fillName, fillZipAndCity],
+                [fillName, fillAddress, fillZipAndCity],
+                [fillAddress, fillZipAndCity, fillName],
+            ];
+            const chosenOrder = fillOrders[Math.floor(Math.random() * fillOrders.length)];
+            // (静默) 拟人填写顺序
+            for (const fillFn of chosenOrder) {
+                await fillFn();
+                if (Math.random() < 0.3) {
+                    // (静默) 鼠标漫游
+                    await continuousHumanRoam(page, randomDelay(1000, 2000));
+                }
             }
         }
 
@@ -1455,25 +1528,90 @@ async function run() {
             await page.mouse.wheel(0, randomDelay(60, 120));
             await page.waitForTimeout(randomDelay(500, 1000));
         }
-        // Stripe 现在多了一个 "Save my payment information" 复选框，原 .Checkbox-Input 会同时匹配两个，触发 strict mode 违规
-        let checkbox = page.locator('#termsOfServiceConsentCheckbox').first();
-        if (!(await checkbox.isVisible().catch(() => false))) {
-            checkbox = page.locator('.Checkbox-Input').last();
-            if (!(await checkbox.isVisible().catch(() => false))) {
-                checkbox = page.locator('.Checkbox-Input').first();
+        // Stripe 的 .Checkbox-Input 是 opacity:0 的隐藏 input，鼠标点击它的 boundingBox
+        // 实际上点不到任何可视目标，导致协议勾选其实从未生效。
+        // 改为：定位 input 节点 → 调 .check() 让 Playwright 走 input.click() 的内置路径，
+        // 失败再退回到点击 input 关联的 label / 父容器。
+        const termsCheckbox = await (async () => {
+            const candidates = [
+                '#termsOfServiceConsentCheckbox',
+                'input[name="termsOfServiceConsent"]',
+                'input[name*="terms" i]',
+                'input[type="checkbox"][aria-describedby*="terms" i]'
+            ];
+            for (const sel of candidates) {
+                const loc = page.locator(sel).first();
+                if (await loc.count().catch(() => 0)) return loc;
             }
-        }
-        const cbBox = await checkbox.boundingBox().catch(() => null);
-        if (cbBox) {
-            const cbClickX = cbBox.x + randomDelay(3, 15);
-            const cbClickY = cbBox.y + randomDelay(3, 15);
-            await page.mouse.move(cbClickX, cbClickY, { steps: randomDelay(20, 35) });
-            page.lastMouseX = cbClickX; page.lastMouseY = cbClickY;
-            await page.waitForTimeout(randomDelay(300, 700));
-            await page.mouse.down();
-            await page.waitForTimeout(randomDelay(50, 120));
-            await page.mouse.up();
-            console.log("✅ [步骤] 协议勾选完成。");
+            // 兜底：DOM 中可能同时存在 "Save my info" 和 "Terms" 两个 .Checkbox-Input，
+            // 协议复选框总是出现得更晚，所以取最后一个。
+            const fallback = page.locator('.Checkbox-Input');
+            const total = await fallback.count().catch(() => 0);
+            return total ? fallback.nth(total - 1) : null;
+        })();
+
+        if (termsCheckbox) {
+            // 真人轨迹：先把鼠标飘到协议附近再勾选，但不再用 mouse.down/up 去打 input boundingBox
+            try {
+                const labelLoc = page.locator('label[for="termsOfServiceConsentCheckbox"]').first();
+                const hoverTarget = (await labelLoc.isVisible().catch(() => false)) ? labelLoc : termsCheckbox;
+                const hoverBox = await hoverTarget.boundingBox().catch(() => null);
+                if (hoverBox) {
+                    await page.mouse.move(
+                        hoverBox.x + hoverBox.width / 2 + randomDelay(-6, 6),
+                        hoverBox.y + hoverBox.height / 2 + randomDelay(-4, 4),
+                        { steps: randomDelay(20, 35) }
+                    );
+                    page.lastMouseX = hoverBox.x + hoverBox.width / 2;
+                    page.lastMouseY = hoverBox.y + hoverBox.height / 2;
+                    await page.waitForTimeout(randomDelay(300, 700));
+                }
+            } catch (_) { /* 鼠标轨迹只是拟人化，不阻塞主流程 */ }
+
+            let checked = false;
+            try {
+                await termsCheckbox.check({ force: true, timeout: 3000 });
+                checked = true;
+            } catch (e1) {
+                console.warn(`⚠️ [步骤] 协议复选框 .check() 失败，回退点击 label: ${e1.message}`);
+                try {
+                    const labelLoc = page.locator('label[for="termsOfServiceConsentCheckbox"]').first();
+                    if (await labelLoc.isVisible().catch(() => false)) {
+                        await labelLoc.click({ force: true, timeout: 3000 });
+                        checked = true;
+                    } else {
+                        // 找不到关联 label 时，点击复选框输入元素的最近 ancestor label / div
+                        await termsCheckbox.evaluate((node) => {
+                            const lbl = node.closest('label') || node.parentElement;
+                            if (lbl) lbl.click();
+                        }).catch(() => { });
+                        checked = true;
+                    }
+                } catch (e2) {
+                    console.warn(`⚠️ [步骤] 协议复选框 label 兜底也失败: ${e2.message}`);
+                }
+            }
+
+            if (checked) {
+                await page.waitForTimeout(randomDelay(180, 360));
+                const isCheckedNow = await termsCheckbox.evaluate((node) => !!node.checked).catch(() => null);
+                if (isCheckedNow === true) {
+                    console.log("✅ [步骤] 协议勾选完成。");
+                } else if (isCheckedNow === false) {
+                    console.warn("⚠️ [步骤] 协议复选框 .check() 已调用但 input.checked=false，强制再勾一次。");
+                    await termsCheckbox.evaluate((node) => {
+                        node.checked = true;
+                        node.dispatchEvent(new Event('input', { bubbles: true }));
+                        node.dispatchEvent(new Event('change', { bubbles: true }));
+                    }).catch(() => { });
+                } else {
+                    console.log("✅ [步骤] 协议勾选完成（无法读取 checked 状态，已尽力勾选）。");
+                }
+            } else {
+                console.warn("⚠️ [步骤] 协议复选框未能勾上，提交可能被 Stripe 拒绝。");
+            }
+        } else {
+            console.log("ℹ️ [步骤] 未找到协议复选框（当前 Stripe 表单可能不含 Terms 同意项）。");
         }
         await page.waitForTimeout(randomDelay(600, 1500));
 
@@ -1543,7 +1681,12 @@ async function run() {
 
             // === Stripe 提交前完整性效验 (不比对一致性，仅确保非空) ===
             const validateStripeCompleteness = async (page) => {
-                // (静默) 校验 Stripe 表单完整性（仅在补填或全部缺失时打印）
+                if (paypalSelected) {
+                    // PayPal 流程下 Card 表单已折叠，pickFirstVisibleStripeInput 会拿到 0×0 节点，
+                    // 强制 humanFillInput 反而会触发 50s waitFor 超时；这里直接跳过即可。
+                    console.log("⏩ [效验] PayPal 流程下不校验 Stripe Card 表单字段。");
+                    return;
+                }
                 const criticalSelectors = [
                     { selectors: ['#billingName'], name: "姓名", val: CONFIG.billing.name },
                     { selectors: ['#billingAddressLine1'], name: "街道地址", val: CONFIG.billing.address },
@@ -1597,6 +1740,56 @@ async function run() {
         // 先等页面加载，刷新一次确保 PayPal 页面干净，再检查滑块
         console.log("⏳ [步骤] 等待跳转到 PayPal 页面...");
         await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => { });
+
+        // 🛑 关键 URL 守卫：很多失败截图实际上仍停留在 Stripe / OpenAI Checkout 页面，
+        // 但旧逻辑直接进入 waitForCreateAccountButton + 多次 reload，最终抛出
+        // "PayPal 未渲染创建账户表单"，掩盖了真实失败阶段（Stripe 提交被验证拦截）。
+        // 这里显式区分两种状态，让父进程能拿到准确的失败原因。
+        const isPayPalUrl = (u) => /^https?:\/\/(?:[^/]*\.)?(?:paypal|sandbox\.paypal|pay\.openai)\.com\//i.test(String(u || ''));
+        const collectVisibleStripeErrors = async () => {
+            return page.evaluate(() => {
+                try {
+                    const set = new Set();
+                    const errSelectors = [
+                        '.FieldError',
+                        '[class*="Field-Error"]',
+                        '[class*="ErrorText"]',
+                        '[class*="errorText"]',
+                        '[role="alert"]',
+                        '[data-testid*="error" i]'
+                    ];
+                    for (const sel of errSelectors) {
+                        document.querySelectorAll(sel).forEach((node) => {
+                            const text = (node.innerText || node.textContent || '').trim();
+                            if (text) set.add(text);
+                        });
+                    }
+                    return Array.from(set).slice(0, 8);
+                } catch (_) { return []; }
+            }).catch(() => []);
+        };
+
+        const navDeadline = Date.now() + 30_000;
+        while (Date.now() < navDeadline) {
+            if (isPayPalUrl(page.url())) break;
+            await page.waitForTimeout(800);
+        }
+        const postSubmitUrl = page.url();
+        if (!isPayPalUrl(postSubmitUrl)) {
+            // 还没跳到 PayPal —— 99% 是 Stripe 提交端验证失败（协议未勾、地址被清、卡未填等）。
+            // 不要再当作"PayPal 未渲染"去刷新 PayPal 域，刷新只会让父进程拿到错误的失败原因。
+            const stripeErrors = await collectVisibleStripeErrors();
+            const hint = stripeErrors.length ? `Stripe 端可见错误: ${stripeErrors.join(' | ')}` : 'Stripe 端未捕获到具体错误文案';
+            console.warn(`⚠️ [步骤] 提交后仍停留在 Stripe (URL=${postSubmitUrl})；${hint}`);
+            try {
+                const blockedPath = buildDebugScreenshotPath('激活', `stripe_submit_blocked`);
+                await page.screenshot({ path: blockedPath, fullPage: true });
+                console.warn(`📸 [系统] Stripe 提交受阻截图已保存: ${blockedPath}`);
+            } catch (_) { /* 截图失败不阻塞抛错 */ }
+            throw new Error(`Stripe 提交未跳转 PayPal：${hint} (URL=${postSubmitUrl})`);
+        }
+        console.log(`✅ [步骤] 已跳转到 PayPal 域：${postSubmitUrl}`);
+
         await solveSlider(); // PayPal 页面的滑块检查
         await checkCriticalErrors();
         console.log("⏳ [步骤] 正在等待 PayPal 创建账户按钮出现...");
